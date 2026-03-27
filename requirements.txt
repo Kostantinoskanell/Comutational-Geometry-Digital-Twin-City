@@ -1,0 +1,6 @@
+geopandas>=0.14
+networkx>=3.2
+numpy>=1.24
+osmnx>=1.9
+pyvista>=0.43
+shapely>=2.0

@@ -1,6 +1,9 @@
 geopandas>=0.14
 networkx>=3.2
+numba>=0.57
 numpy>=1.24
 osmnx>=1.9
 pyvista>=0.43
+scipy>=1.10
 shapely>=2.0
+tqdm>=4.65

@@ -1,4 +1,6 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python.defaultInterpreterPath": "/Users/konstantinoskanellopoulos/anaconda3/envs/computational_geometry/bin/python",
+    "python.terminal.activateEnvironment": true
 }

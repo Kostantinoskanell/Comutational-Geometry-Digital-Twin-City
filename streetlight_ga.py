@@ -2,15 +2,88 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+import networkx as nx
 import numpy as np
 import pyvista as pv
+from shapely import contains_xy, intersects_xy
+from shapely.geometry import MultiLineString
+from shapely.geometry.base import BaseGeometry
 
+from shadow_engine import build_coverage_matrix
 from spatial_trees import QuadtreeNode
 
 EPS = 1e-9
+
+
+def build_candidate_grid_points(
+    bounds_min_xy: np.ndarray,
+    bounds_max_xy: np.ndarray,
+    grid_step: float,
+    sidewalk_polygon: BaseGeometry | None = None,
+) -> np.ndarray:
+    """Build 2D grid candidates and optionally keep only sidewalk-intersecting points."""
+    step = float(grid_step)
+    if step <= 0:
+        raise ValueError("grid_step must be > 0.")
+
+    bmin = np.asarray(bounds_min_xy, dtype=float)
+    bmax = np.asarray(bounds_max_xy, dtype=float)
+    if bmin.shape != (2,) or bmax.shape != (2,):
+        raise ValueError("bounds_min_xy and bounds_max_xy must have shape (2,).")
+
+    x0, y0 = bmin
+    x1, y1 = bmax
+    xs = np.arange(x0, x1 + step * 0.5, step, dtype=float)
+    ys = np.arange(y0, y1 + step * 0.5, step, dtype=float)
+
+    if xs.size == 0 or ys.size == 0:
+        return np.empty((0, 2), dtype=float)
+
+    gx, gy = np.meshgrid(xs, ys, indexing="xy")
+    grid = np.column_stack((gx.ravel(), gy.ravel()))
+
+    if sidewalk_polygon is None or sidewalk_polygon.is_empty:
+        return grid
+
+    # Shapely 2.x vectorized predicates are much faster than per-point Python calls.
+    x = np.asarray(grid[:, 0], dtype=float)
+    y = np.asarray(grid[:, 1], dtype=float)
+    keep = np.asarray(contains_xy(sidewalk_polygon, x, y) | intersects_xy(sidewalk_polygon, x, y), dtype=bool)
+    return grid[keep]
+
+
+def build_sidewalk_polygon_from_street_graph(
+    street_graph: nx.MultiDiGraph,
+    road_buffer_m: float = 3.0,
+    sidewalk_buffer_m: float = 5.0,
+) -> BaseGeometry | None:
+    """Construct sidewalk polygon from centerline buffers (sidewalk ring minus road)."""
+    if road_buffer_m <= 0.0:
+        raise ValueError("road_buffer_m must be > 0.")
+    if sidewalk_buffer_m <= road_buffer_m:
+        raise ValueError("sidewalk_buffer_m must be > road_buffer_m.")
+
+    seg_starts, seg_ends = _extract_street_segments_xy(street_graph)
+    if seg_starts.shape[0] == 0:
+        return None
+
+    lines = [
+        ((float(a[0]), float(a[1])), (float(b[0]), float(b[1])))
+        for a, b in zip(seg_starts, seg_ends)
+    ]
+    centerlines = MultiLineString(lines)
+
+    road_polygon = centerlines.buffer(float(road_buffer_m))
+    sidewalk_outer = centerlines.buffer(float(sidewalk_buffer_m))
+    sidewalk_polygon = sidewalk_outer.difference(road_polygon)
+
+    if sidewalk_polygon.is_empty:
+        return None
+    return sidewalk_polygon
 
 
 @dataclass
@@ -28,14 +101,23 @@ class GAConfig:
     max_depth: int = 6
     max_triangles: int = 50
     seed: int | None = None
+    fitness_workers: int = 1
+    progress_every: int = 5
+    verbose: bool = False
 
 
 class StreetlightGA:
     """Genetic optimizer for streetlight coordinates on a 2D grid."""
 
-    def __init__(self, ground_mesh: pv.PolyData, config: GAConfig):
+    def __init__(
+        self,
+        ground_mesh: pv.PolyData,
+        config: GAConfig,
+        sidewalk_polygon: BaseGeometry | None = None,
+    ):
         self.config = config
         self.rng = np.random.default_rng(config.seed)
+        self.sidewalk_polygon = sidewalk_polygon
 
         (
             self.triangles_xy,
@@ -46,8 +128,8 @@ class StreetlightGA:
         ) = self._extract_ground_triangles(ground_mesh)
 
         self.total_area = float(np.sum(self.areas))
-        self.quadtree_root = self._build_quadtree()
-        self.triangle_key_to_indices = self._build_triangle_lookup()
+        self.quadtree_root: QuadtreeNode | None = None
+        self.triangle_key_to_indices: Dict[bytes, List[int]] | None = None
 
         self.grid_points = self._build_grid_points()
         if self.grid_points.shape[0] == 0:
@@ -58,6 +140,12 @@ class StreetlightGA:
 
         if self.config.light_radius <= 0:
             raise ValueError("light_radius must be > 0.")
+
+        self.precomputed_coverage: np.ndarray | None = None
+        self._grid_index_lookup: Dict[bytes, int] = {
+            np.ascontiguousarray(p).tobytes(): int(i) for i, p in enumerate(self.grid_points)
+        }
+        self.weights = np.ones(self.triangles_xy.shape[0], dtype=float)
 
     @staticmethod
     def _extract_ground_triangles(
@@ -108,28 +196,30 @@ class StreetlightGA:
         return lookup
 
     def _build_grid_points(self) -> np.ndarray:
-        step = float(self.config.grid_step)
-        if step <= 0:
-            raise ValueError("grid_step must be > 0.")
-
-        x0, y0 = self.bounds_min
-        x1, y1 = self.bounds_max
-
-        xs = np.arange(x0, x1 + step * 0.5, step, dtype=float)
-        ys = np.arange(y0, y1 + step * 0.5, step, dtype=float)
-
-        if xs.size == 0 or ys.size == 0:
-            return np.empty((0, 2), dtype=float)
-
-        gx, gy = np.meshgrid(xs, ys, indexing="xy")
-        return np.column_stack((gx.ravel(), gy.ravel()))
+        return build_candidate_grid_points(
+            bounds_min_xy=self.bounds_min,
+            bounds_max_xy=self.bounds_max,
+            grid_step=self.config.grid_step,
+            sidewalk_polygon=self.sidewalk_polygon,
+        )
 
     @staticmethod
     def _circle_aabb_intersects(center: np.ndarray, radius: float, aabb_min: np.ndarray, aabb_max: np.ndarray) -> bool:
         closest = np.clip(center, aabb_min, aabb_max)
         return float(np.dot(closest - center, closest - center)) <= radius * radius + EPS
 
+    def _ensure_spatial_index(self) -> None:
+        """Build quadtree + triangle lookup on demand for radius neighborhood queries."""
+        if self.quadtree_root is None:
+            self.quadtree_root = self._build_quadtree()
+        if self.triangle_key_to_indices is None:
+            self.triangle_key_to_indices = self._build_triangle_lookup()
+
     def _query_triangle_indices_in_radius(self, center_xy: np.ndarray, radius: float) -> np.ndarray:
+        self._ensure_spatial_index()
+        if self.quadtree_root is None or self.triangle_key_to_indices is None:
+            return np.empty((0,), dtype=np.int64)
+
         stack = [self.quadtree_root]
         out_indices: set[int] = set()
 
@@ -152,73 +242,137 @@ class StreetlightGA:
 
         return np.fromiter(out_indices, dtype=np.int64)
 
-    def evaluate_cost(self, light_positions: np.ndarray) -> float:
-        """Compute J = w1 * dark_area + w2 * double_lit_area."""
-        positions = np.asarray(light_positions, dtype=float)
-        if positions.shape != (self.config.n_lights, 2):
-            raise ValueError("light_positions must have shape (n_lights, 2).")
+    def evaluate_cost(self, individual_indices: np.ndarray) -> float:
+        """Night-mode objective using coverage-matrix row indices.
 
-        lit_counts = np.zeros(self.triangles_xy.shape[0], dtype=np.int32)
+        The chromosome is an integer array of length N where each value is a row
+        index into the (M, K) coverage matrix.
+        """
+        if self.precomputed_coverage is None:
+            raise ValueError("Precomputed coverage matrix is required for evaluate_cost.")
+
+        idx = np.asarray(individual_indices, dtype=np.int64)
+        if idx.ndim != 1 or idx.shape[0] != self.config.n_lights:
+            raise ValueError("individual_indices must have shape (n_lights,).")
+
+        if np.any(idx < 0) or np.any(idx >= self.precomputed_coverage.shape[0]):
+            raise ValueError("individual_indices contains out-of-range grid row indices.")
+
+        counts = np.sum(self.precomputed_coverage[idx], axis=0, dtype=np.int32)
+        dark_mask = counts == 0
+        double_mask = counts >= 2
+
+        area_dark = float(np.sum(self.areas[dark_mask] * self.weights[dark_mask]))
+        area_double_lit = float(np.sum(self.areas[double_mask]))
+
+        return self.config.w1_dark * area_dark + self.config.w2_double_lit * area_double_lit
+
+    def set_precomputed_coverage(self, coverage_matrix: np.ndarray) -> None:
+        """Attach precomputed (M, K) boolean matrix where M is grid points and K is triangles."""
+        cov = np.asarray(coverage_matrix)
+        if cov.ndim != 2:
+            raise ValueError("coverage_matrix must be 2D with shape (M, K).")
+        if cov.shape[0] != self.grid_points.shape[0]:
+            raise ValueError("coverage_matrix row count must match number of grid points.")
+        if cov.shape[1] != self.triangles_xy.shape[0]:
+            raise ValueError("coverage_matrix column count must match number of ground triangles.")
+
+        self.precomputed_coverage = cov.astype(bool, copy=False)
+
+    def set_triangle_weights(self, weights: np.ndarray) -> None:
+        """Set per-triangle priority weights used in weighted dark-area penalty."""
+        w = np.asarray(weights, dtype=float)
+        if w.ndim != 1 or w.shape[0] != self.triangles_xy.shape[0]:
+            raise ValueError("weights must have shape (K,) matching number of ground triangles.")
+        if np.any(w < 0.0):
+            raise ValueError("weights must be non-negative.")
+        self.weights = w
+
+    def build_radius_coverage_matrix(self) -> np.ndarray:
+        """Build fast geometric (radius-only) coverage matrix with shape (M, K)."""
+        m = self.grid_points.shape[0]
+        k = self.centroids_xy.shape[0]
+        cov = np.zeros((m, k), dtype=bool)
         r2 = self.config.light_radius * self.config.light_radius
 
-        for light_xy in positions:
-            candidate_indices = self._query_triangle_indices_in_radius(light_xy, self.config.light_radius)
-            if candidate_indices.size == 0:
-                continue
+        for i, gp in enumerate(self.grid_points):
+            delta = self.centroids_xy - gp
+            cov[i] = np.einsum("ij,ij->i", delta, delta) <= r2 + EPS
 
-            delta = self.centroids_xy[candidate_indices] - light_xy
-            inside = np.einsum("ij,ij->i", delta, delta) <= r2 + EPS
-            lit_counts[candidate_indices[inside]] += 1
+        return cov
 
-        dark_area = float(np.sum(self.areas[lit_counts == 0]))
-        double_lit_area = float(np.sum(self.areas[lit_counts >= 2]))
-
-        return self.config.w1_dark * dark_area + self.config.w2_double_lit * double_lit_area
+    def counts_from_indices(self, individual_indices: np.ndarray) -> np.ndarray:
+        """Return per-triangle illumination counts from chromosome row indices."""
+        if self.precomputed_coverage is None:
+            raise ValueError("Precomputed coverage matrix is required.")
+        idx = np.asarray(individual_indices, dtype=np.int64)
+        return np.sum(self.precomputed_coverage[idx], axis=0, dtype=np.int32)
 
     def _random_individual(self) -> np.ndarray:
         n_grid = self.grid_points.shape[0]
         n_lights = self.config.n_lights
 
-        if n_grid >= n_lights:
-            sel = self.rng.choice(n_grid, size=n_lights, replace=False)
-        else:
-            sel = self.rng.choice(n_grid, size=n_lights, replace=True)
-
-        return np.array(self.grid_points[sel], dtype=float)
+        sel = self.rng.choice(n_grid, size=n_lights, replace=True)
+        return np.asarray(sel, dtype=np.int64)
 
     def _initialize_population(self) -> np.ndarray:
-        return np.array([self._random_individual() for _ in range(self.config.population_size)], dtype=float)
+        return np.array([self._random_individual() for _ in range(self.config.population_size)], dtype=np.int64)
 
     def _tournament_select(self, population: np.ndarray, costs: np.ndarray) -> np.ndarray:
         k = max(2, int(self.config.tournament_k))
         idxs = self.rng.choice(population.shape[0], size=k, replace=False)
         best = idxs[np.argmin(costs[idxs])]
-        return np.array(population[best], copy=True)
+        return np.array(population[best], dtype=np.int64, copy=True)
 
     def _crossover(self, parent_a: np.ndarray, parent_b: np.ndarray) -> np.ndarray:
         mask = self.rng.random(self.config.n_lights) < 0.5
-        child = np.array(parent_a, copy=True)
+        child = np.array(parent_a, dtype=np.int64, copy=True)
         child[mask] = parent_b[mask]
         return child
 
     def _mutate(self, individual: np.ndarray) -> np.ndarray:
-        out = np.array(individual, copy=True)
+        out = np.array(individual, dtype=np.int64, copy=True)
         for i in range(self.config.n_lights):
             if self.rng.random() < self.config.mutation_rate:
                 gidx = self.rng.integers(0, self.grid_points.shape[0])
-                out[i] = self.grid_points[gidx]
+                out[i] = int(gidx)
         return out
+
+    def _evaluate_population_costs(self, population: np.ndarray) -> np.ndarray:
+        if self.precomputed_coverage is None:
+            raise ValueError("Precomputed coverage matrix is required for cost evaluation.")
+
+        pop = np.asarray(population, dtype=np.int64)
+        if pop.ndim != 2 or pop.shape[1] != self.config.n_lights:
+            raise ValueError("population must have shape (P, n_lights).")
+
+        if np.any(pop < 0) or np.any(pop >= self.precomputed_coverage.shape[0]):
+            raise ValueError("population contains out-of-range grid row indices.")
+
+        # Coverage gather: (P, N, K) -> counts (P, K), where:
+        # P = population size, N = n_lights, K = triangles.
+        counts = np.sum(self.precomputed_coverage[pop], axis=1, dtype=np.int16)
+        dark_mask = counts == 0
+        double_mask = counts >= 2
+
+        weighted_areas = self.areas * self.weights
+        area_dark = dark_mask @ weighted_areas
+        area_double_lit = double_mask @ self.areas
+
+        return self.config.w1_dark * area_dark + self.config.w2_double_lit * area_double_lit
 
     def optimize(self) -> Tuple[np.ndarray, float, np.ndarray]:
         """Run GA and return (best_positions, best_cost, history)."""
         population = self._initialize_population()
         history = np.empty((self.config.generations,), dtype=float)
 
-        best_positions = np.array(population[0], copy=True)
+        best_indices = np.array(population[0], dtype=np.int64, copy=True)
         best_cost = np.inf
+        t0 = time.perf_counter()
+        progress_every = max(1, int(self.config.progress_every))
 
         for gen in range(self.config.generations):
-            costs = np.array([self.evaluate_cost(ind) for ind in population], dtype=float)
+            costs = self._evaluate_population_costs(population)
 
             gen_best_idx = int(np.argmin(costs))
             gen_best_cost = float(costs[gen_best_idx])
@@ -226,11 +380,13 @@ class StreetlightGA:
 
             if gen_best_cost < best_cost:
                 best_cost = gen_best_cost
-                best_positions = np.array(population[gen_best_idx], copy=True)
+                best_indices = np.array(population[gen_best_idx], dtype=np.int64, copy=True)
 
             elite_count = max(0, min(self.config.elitism, self.config.population_size))
             elites = np.argsort(costs)[:elite_count]
-            next_pop: list[np.ndarray] = [np.array(population[i], copy=True) for i in elites]
+            next_pop: list[np.ndarray] = [
+                np.array(population[i], dtype=np.int64, copy=True) for i in elites
+            ]
 
             while len(next_pop) < self.config.population_size:
                 p1 = self._tournament_select(population, costs)
@@ -239,9 +395,21 @@ class StreetlightGA:
                 child = self._mutate(child)
                 next_pop.append(child)
 
-            population = np.array(next_pop, dtype=float)
+            population = np.array(next_pop, dtype=np.int64)
 
-        return best_positions, best_cost, history
+            if self.config.verbose and (
+                gen == 0
+                or ((gen + 1) % progress_every == 0)
+                or (gen + 1 == self.config.generations)
+            ):
+                elapsed = time.perf_counter() - t0
+                print(
+                    f"GA progress {gen + 1:>3}/{self.config.generations}: "
+                    f"gen_best={gen_best_cost:.6f}, global_best={best_cost:.6f}, "
+                    f"elapsed={elapsed:.1f}s"
+                )
+
+        return best_indices, best_cost, history
 
 
 def optimize_streetlights(
@@ -255,6 +423,17 @@ def optimize_streetlights(
     generations: int = 80,
     mutation_rate: float = 0.12,
     seed: int | None = None,
+    octree_root=None,
+    pole_height: float = 3.0,
+    use_precomputed_coverage: bool = False,
+    ground_weights: np.ndarray | None = None,
+    precomputed_coverage_matrix: np.ndarray | None = None,
+    street_graph: nx.MultiDiGraph | None = None,
+    sidewalk_polygon: BaseGeometry | None = None,
+    spotlight_half_angle_deg: float = 45.0,
+    ga_jobs: int = 1,
+    ga_progress_every: int = 5,
+    ga_verbose: bool = False,
 ) -> Dict[str, np.ndarray | float]:
     """Convenience wrapper for running the streetlight GA optimization."""
     config = GAConfig(
@@ -267,32 +446,149 @@ def optimize_streetlights(
         generations=generations,
         mutation_rate=mutation_rate,
         seed=seed,
+        fitness_workers=max(1, int(ga_jobs)),
+        progress_every=max(1, int(ga_progress_every)),
+        verbose=bool(ga_verbose),
     )
 
-    solver = StreetlightGA(ground_mesh=ground_mesh, config=config)
-    best_positions, best_cost, history = solver.optimize()
+    resolved_sidewalk_polygon = sidewalk_polygon
+    if resolved_sidewalk_polygon is None and street_graph is not None:
+        resolved_sidewalk_polygon = build_sidewalk_polygon_from_street_graph(street_graph)
+
+    solver = StreetlightGA(
+        ground_mesh=ground_mesh,
+        config=config,
+        sidewalk_polygon=resolved_sidewalk_polygon,
+    )
+
+    if precomputed_coverage_matrix is not None:
+        solver.set_precomputed_coverage(precomputed_coverage_matrix)
+    elif use_precomputed_coverage:
+        if octree_root is None:
+            raise ValueError("octree_root is required when use_precomputed_coverage=True.")
+        coverage = build_coverage_matrix(
+            grid_points=solver.grid_points,
+            ground_mesh=ground_mesh,
+            octree_root=octree_root,
+            radius=light_radius,
+            pole_height=pole_height,
+            street_graph=street_graph,
+            spotlight_half_angle_deg=spotlight_half_angle_deg,
+        )
+        solver.set_precomputed_coverage(coverage)
+    else:
+        # Fallback matrix: geometric radius-only coverage (no LOS blockers).
+        solver.set_precomputed_coverage(solver.build_radius_coverage_matrix())
+
+    if ground_weights is not None:
+        solver.set_triangle_weights(ground_weights)
+
+    best_indices, best_cost, history = solver.optimize()
+    best_positions = solver.grid_points[best_indices]
 
     lit_ratio = 1.0
     if solver.total_area > EPS:
-        # Recover dark and double-lit effects indirectly through final score decomposition.
-        # We recompute counts once for the best layout and derive lit ratio directly.
-        lit_counts = np.zeros(solver.triangles_xy.shape[0], dtype=np.int32)
-        r2 = config.light_radius * config.light_radius
-
-        for light_xy in best_positions:
-            cand = solver._query_triangle_indices_in_radius(light_xy, config.light_radius)
-            if cand.size == 0:
-                continue
-            delta = solver.centroids_xy[cand] - light_xy
-            inside = np.einsum("ij,ij->i", delta, delta) <= r2 + EPS
-            lit_counts[cand[inside]] += 1
-
+        lit_counts = solver.counts_from_indices(best_indices)
         lit_area = float(np.sum(solver.areas[lit_counts > 0]))
         lit_ratio = lit_area / solver.total_area
 
     return {
         "best_positions": best_positions,
+        "best_indices": best_indices,
+        "final_counts": solver.counts_from_indices(best_indices),
         "best_cost": float(best_cost),
         "history": history,
         "lit_ratio": float(lit_ratio),
     }
+
+
+def _extract_street_segments_xy(street_graph: nx.MultiDiGraph) -> tuple[np.ndarray, np.ndarray]:
+    """Extract XY street segments from graph edge geometry or endpoint nodes."""
+    starts: list[tuple[float, float]] = []
+    ends: list[tuple[float, float]] = []
+
+    for u, v, data in street_graph.edges(data=True):
+        geom = data.get("geometry")
+
+        if geom is not None and hasattr(geom, "coords"):
+            coords = np.asarray(geom.coords, dtype=float)
+            if coords.shape[0] < 2:
+                continue
+            xy = coords[:, :2]
+            for i in range(xy.shape[0] - 1):
+                starts.append((float(xy[i, 0]), float(xy[i, 1])))
+                ends.append((float(xy[i + 1, 0]), float(xy[i + 1, 1])))
+            continue
+
+        nu = street_graph.nodes.get(u, {})
+        nv = street_graph.nodes.get(v, {})
+        if "x" in nu and "y" in nu and "x" in nv and "y" in nv:
+            starts.append((float(nu["x"]), float(nu["y"])))
+            ends.append((float(nv["x"]), float(nv["y"])))
+
+    if not starts:
+        return np.empty((0, 2), dtype=float), np.empty((0, 2), dtype=float)
+
+    return np.asarray(starts, dtype=float), np.asarray(ends, dtype=float)
+
+
+def _min_distance_point_to_segments(point_xy: np.ndarray, seg_starts: np.ndarray, seg_ends: np.ndarray) -> float:
+    """Compute minimum Euclidean distance from a point to a set of 2D segments."""
+    p = np.asarray(point_xy, dtype=float)
+    v = seg_ends - seg_starts
+    w = p - seg_starts
+
+    vv = np.einsum("ij,ij->i", v, v)
+    near_zero = vv <= EPS
+
+    t = np.zeros_like(vv)
+    valid = ~near_zero
+    t[valid] = np.einsum("ij,ij->i", w[valid], v[valid]) / vv[valid]
+    t = np.clip(t, 0.0, 1.0)
+
+    proj = seg_starts + t[:, None] * v
+    delta = p - proj
+    d2 = np.einsum("ij,ij->i", delta, delta)
+
+    if np.any(near_zero):
+        dd = p - seg_starts[near_zero]
+        d2[near_zero] = np.einsum("ij,ij->i", dd, dd)
+
+    return float(np.sqrt(np.min(d2)))
+
+
+def compute_ground_weights(
+    ground_mesh: pv.PolyData,
+    street_graph: nx.MultiDiGraph,
+    max_dist: float = 15.0,
+) -> np.ndarray:
+    """Compute triangle priority weights based on centroid distance to streets.
+
+    Triangles whose centroid lies within ``max_dist`` of any street segment receive
+    weight ``10.0``; all others receive weight ``1.0``.
+    """
+    if max_dist < 0.0:
+        raise ValueError("max_dist must be >= 0.")
+
+    tri_mesh = ground_mesh.triangulate()
+    if tri_mesh.n_cells == 0:
+        return np.empty((0,), dtype=float)
+
+    faces = tri_mesh.faces.reshape(-1, 4)
+    if not np.all(faces[:, 0] == 3):
+        raise ValueError("ground_mesh triangulation produced non-triangle faces.")
+
+    points = np.asarray(tri_mesh.points, dtype=float)
+    tri_pts = points[faces[:, 1:4]]
+    centroids_xy = np.mean(tri_pts[:, :, :2], axis=1)
+
+    seg_starts, seg_ends = _extract_street_segments_xy(street_graph)
+    if seg_starts.shape[0] == 0:
+        return np.ones((centroids_xy.shape[0],), dtype=float)
+
+    weights = np.ones((centroids_xy.shape[0],), dtype=float)
+    for i, cxy in enumerate(centroids_xy):
+        if _min_distance_point_to_segments(cxy, seg_starts, seg_ends) <= max_dist + EPS:
+            weights[i] = 10.0
+
+    return weights

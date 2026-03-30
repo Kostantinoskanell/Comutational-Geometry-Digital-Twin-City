@@ -13,6 +13,28 @@ EPS = 1e-12
 ArrayF = np.ndarray
 
 
+def _aabb_overlaps(a_min: ArrayF, a_max: ArrayF, b_min: ArrayF, b_max: ArrayF) -> bool:
+    return bool(np.all(a_max >= b_min - EPS) and np.all(a_min <= b_max + EPS))
+
+
+def _aabb_contains(outer_min: ArrayF, outer_max: ArrayF, inner_min: ArrayF, inner_max: ArrayF) -> bool:
+    return bool(np.all(inner_min >= outer_min - EPS) and np.all(inner_max <= outer_max + EPS))
+
+
+def _point_in_aabb_3d(point: ArrayF, aabb_min: ArrayF, aabb_max: ArrayF) -> bool:
+    p = np.asarray(point, dtype=float)
+    if p.shape != (3,):
+        raise ValueError("Point must have shape (3,).")
+    return bool(np.all(p >= aabb_min - EPS) and np.all(p <= aabb_max + EPS))
+
+
+def _point_in_aabb_2d(point: ArrayF, aabb_min: ArrayF, aabb_max: ArrayF) -> bool:
+    p = np.asarray(point, dtype=float)
+    if p.shape != (2,):
+        raise ValueError("Point must have shape (2,).")
+    return bool(np.all(p >= aabb_min - EPS) and np.all(p <= aabb_max + EPS))
+
+
 def _as_triangle_3d(triangle: ArrayF) -> ArrayF:
     tri = np.asarray(triangle, dtype=float)
     if tri.shape != (3, 3):
@@ -29,98 +51,14 @@ def _as_triangle_2d(triangle: ArrayF) -> ArrayF:
     raise ValueError("Triangle must have shape (3, 3) or (3, 2).")
 
 
-def _projected_interval(points: ArrayF, axis: ArrayF) -> tuple[float, float]:
-    proj = points @ axis
-    return float(np.min(proj)), float(np.max(proj))
-
-
-def _separated_1d(min_a: float, max_a: float, min_b: float, max_b: float) -> bool:
-    return max_a < min_b or max_b < min_a
-
-
-def _triangle_aabb_intersects_3d(triangle: ArrayF, aabb_min: ArrayF, aabb_max: ArrayF) -> bool:
-    """Triangle vs AABB overlap test via SAT in 3D."""
+def _triangle_bbox_3d(triangle: ArrayF) -> tuple[ArrayF, ArrayF]:
     tri = _as_triangle_3d(triangle)
-    aabb_min = np.asarray(aabb_min, dtype=float)
-    aabb_max = np.asarray(aabb_max, dtype=float)
-
-    tri_min = np.min(tri, axis=0)
-    tri_max = np.max(tri, axis=0)
-    if np.any(tri_max < aabb_min) or np.any(tri_min > aabb_max):
-        return False
-
-    center = 0.5 * (aabb_min + aabb_max)
-    half = 0.5 * (aabb_max - aabb_min)
-    v = tri - center
-
-    edges = [v[1] - v[0], v[2] - v[1], v[0] - v[2]]
-
-    axes: list[ArrayF] = [
-        np.array([1.0, 0.0, 0.0]),
-        np.array([0.0, 1.0, 0.0]),
-        np.array([0.0, 0.0, 1.0]),
-    ]
-
-    tri_normal = np.cross(edges[0], edges[1])
-    axes.append(tri_normal)
-
-    box_axes = axes[:3]
-    for edge in edges:
-        for box_axis in box_axes:
-            axes.append(np.cross(edge, box_axis))
-
-    for axis in axes:
-        axis_len = np.linalg.norm(axis)
-        if axis_len <= EPS:
-            continue
-        axis = axis / axis_len
-
-        tri_lo, tri_hi = _projected_interval(v, axis)
-        radius = float(np.dot(half, np.abs(axis)))
-        box_lo, box_hi = -radius, radius
-
-        if _separated_1d(tri_lo, tri_hi, box_lo, box_hi):
-            return False
-
-    return True
+    return np.min(tri, axis=0), np.max(tri, axis=0)
 
 
-def _triangle_aabb_intersects_2d(triangle: ArrayF, aabb_min_xy: ArrayF, aabb_max_xy: ArrayF) -> bool:
-    """Triangle vs AABB overlap test in XY only (quadtree variant)."""
-    tri = _as_triangle_2d(triangle)
-    aabb_min = np.asarray(aabb_min_xy, dtype=float)
-    aabb_max = np.asarray(aabb_max_xy, dtype=float)
-
-    tri_min = np.min(tri, axis=0)
-    tri_max = np.max(tri, axis=0)
-    if np.any(tri_max < aabb_min) or np.any(tri_min > aabb_max):
-        return False
-
-    center = 0.5 * (aabb_min + aabb_max)
-    half = 0.5 * (aabb_max - aabb_min)
-    v = tri - center
-
-    edges = [v[1] - v[0], v[2] - v[1], v[0] - v[2]]
-    axes: list[ArrayF] = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
-
-    for edge in edges:
-        perp = np.array([-edge[1], edge[0]])
-        axes.append(perp)
-
-    for axis in axes:
-        axis_len = np.linalg.norm(axis)
-        if axis_len <= EPS:
-            continue
-        axis = axis / axis_len
-
-        tri_lo, tri_hi = _projected_interval(v, axis)
-        radius = float(np.dot(half, np.abs(axis)))
-        box_lo, box_hi = -radius, radius
-
-        if _separated_1d(tri_lo, tri_hi, box_lo, box_hi):
-            return False
-
-    return True
+def _triangle_bbox_2d(triangle: ArrayF) -> tuple[ArrayF, ArrayF]:
+    tri2 = _as_triangle_2d(triangle)
+    return np.min(tri2, axis=0), np.max(tri2, axis=0)
 
 
 @dataclass
@@ -133,6 +71,7 @@ class OctreeNode:
     max_depth: int = 6
     max_triangles: int = 50
     triangles: List[ArrayF] = field(default_factory=list)
+    points: List[ArrayF] = field(default_factory=list)
     children: list["OctreeNode"] | None = None
 
     def __post_init__(self) -> None:
@@ -181,17 +120,14 @@ class OctreeNode:
         self.children = children
 
     def insert(self, triangle: ArrayF) -> bool:
-        """Insert a triangle into this node or its descendants if intersecting."""
+        """Insert triangle by AABB overlap and push to one fully-containing child when possible."""
         tri = _as_triangle_3d(triangle)
-        if not _triangle_aabb_intersects_3d(tri, self.aabb_min, self.aabb_max):
+        tri_min, tri_max = _triangle_bbox_3d(tri)
+        if not _aabb_overlaps(tri_min, tri_max, self.aabb_min, self.aabb_max):
             return False
 
         if self.children is not None:
-            inserted = False
-            for child in self.children:
-                if child.insert(tri):
-                    inserted = True
-            if not inserted:
+            if not self._insert_into_single_containing_child(tri, tri_min, tri_max):
                 self.triangles.append(tri)
             return True
 
@@ -203,6 +139,23 @@ class OctreeNode:
 
         return True
 
+    def _insert_into_single_containing_child(self, tri: ArrayF, tri_min: ArrayF, tri_max: ArrayF) -> bool:
+        if self.children is None:
+            return False
+
+        containing: list[OctreeNode] = []
+        for child in self.children:
+            if _aabb_contains(child.aabb_min, child.aabb_max, tri_min, tri_max):
+                containing.append(child)
+                if len(containing) > 1:
+                    return False
+
+        if len(containing) == 1:
+            containing[0].insert(tri)
+            return True
+
+        return False
+
     def _redistribute(self) -> None:
         if self.children is None:
             return
@@ -211,12 +164,67 @@ class OctreeNode:
         self.triangles = []
 
         for tri in existing:
+            tri_min, tri_max = _triangle_bbox_3d(tri)
+            if not self._insert_into_single_containing_child(tri, tri_min, tri_max):
+                self.triangles.append(tri)
+
+    def _redistribute_points(self) -> None:
+        if self.children is None:
+            return
+
+        existing = self.points
+        self.points = []
+
+        for point in existing:
             inserted = False
             for child in self.children:
-                if child.insert(tri):
+                if child.insert_point(point):
                     inserted = True
+                    break
             if not inserted:
-                self.triangles.append(tri)
+                self.points.append(point)
+
+    def insert_point(self, point: ArrayF) -> bool:
+        """Insert a 3D point (e.g., triangle centroid/vertex) into the octree."""
+        p = np.asarray(point, dtype=float)
+        if p.shape != (3,):
+            raise ValueError("Point must have shape (3,).")
+
+        if not _point_in_aabb_3d(p, self.aabb_min, self.aabb_max):
+            return False
+
+        if self.children is not None:
+            for child in self.children:
+                if child.insert_point(p):
+                    return True
+            self.points.append(p)
+            return True
+
+        self.points.append(p)
+
+        if len(self.points) > self.max_triangles and self.depth < self.max_depth:
+            self.subdivide()
+            self._redistribute()
+            self._redistribute_points()
+
+        return True
+
+    def get_bounding_boxes(self) -> list[tuple[float, float, float, float, float, float]]:
+        """Return all node AABBs recursively as (min_x, max_x, min_y, max_y, min_z, max_z)."""
+        out = [
+            (
+                float(self.aabb_min[0]),
+                float(self.aabb_max[0]),
+                float(self.aabb_min[1]),
+                float(self.aabb_max[1]),
+                float(self.aabb_min[2]),
+                float(self.aabb_max[2]),
+            )
+        ]
+        if self.children is not None:
+            for child in self.children:
+                out.extend(child.get_bounding_boxes())
+        return out
 
     def insert_many(self, triangles: Iterable[ArrayF]) -> None:
         for tri in triangles:
@@ -233,6 +241,7 @@ class QuadtreeNode:
     max_depth: int = 6
     max_triangles: int = 50
     triangles: List[ArrayF] = field(default_factory=list)
+    points: List[ArrayF] = field(default_factory=list)
     children: list["QuadtreeNode"] | None = None
 
     def __post_init__(self) -> None:
@@ -278,17 +287,14 @@ class QuadtreeNode:
         self.children = children
 
     def insert(self, triangle: ArrayF) -> bool:
-        """Insert a triangle by XY overlap into this node or descendants."""
+        """Insert triangle by XY AABB overlap and push to one containing child when possible."""
         tri2 = _as_triangle_2d(triangle)
-        if not _triangle_aabb_intersects_2d(tri2, self.aabb_min, self.aabb_max):
+        tri_min, tri_max = _triangle_bbox_2d(tri2)
+        if not _aabb_overlaps(tri_min, tri_max, self.aabb_min, self.aabb_max):
             return False
 
         if self.children is not None:
-            inserted = False
-            for child in self.children:
-                if child.insert(tri2):
-                    inserted = True
-            if not inserted:
+            if not self._insert_into_single_containing_child(tri2, tri_min, tri_max):
                 self.triangles.append(tri2)
             return True
 
@@ -300,6 +306,23 @@ class QuadtreeNode:
 
         return True
 
+    def _insert_into_single_containing_child(self, tri2: ArrayF, tri_min: ArrayF, tri_max: ArrayF) -> bool:
+        if self.children is None:
+            return False
+
+        containing: list[QuadtreeNode] = []
+        for child in self.children:
+            if _aabb_contains(child.aabb_min, child.aabb_max, tri_min, tri_max):
+                containing.append(child)
+                if len(containing) > 1:
+                    return False
+
+        if len(containing) == 1:
+            containing[0].insert(tri2)
+            return True
+
+        return False
+
     def _redistribute(self) -> None:
         if self.children is None:
             return
@@ -308,12 +331,71 @@ class QuadtreeNode:
         self.triangles = []
 
         for tri in existing:
+            tri_min, tri_max = _triangle_bbox_2d(tri)
+            if not self._insert_into_single_containing_child(tri, tri_min, tri_max):
+                self.triangles.append(tri)
+
+    def _redistribute_points(self) -> None:
+        if self.children is None:
+            return
+
+        existing = self.points
+        self.points = []
+
+        for point in existing:
             inserted = False
             for child in self.children:
-                if child.insert(tri):
+                if child.insert_point(point):
                     inserted = True
+                    break
             if not inserted:
-                self.triangles.append(tri)
+                self.points.append(point)
+
+    def insert_point(self, point: ArrayF) -> bool:
+        """Insert a 2D point (x, y) or 3D point (x, y, z) into the quadtree."""
+        p = np.asarray(point, dtype=float)
+        if p.shape == (3,):
+            p2 = p[:2]
+        elif p.shape == (2,):
+            p2 = p
+        else:
+            raise ValueError("Point must have shape (2,) or (3,).")
+
+        if not _point_in_aabb_2d(p2, self.aabb_min, self.aabb_max):
+            return False
+
+        if self.children is not None:
+            for child in self.children:
+                if child.insert_point(p2):
+                    return True
+            self.points.append(p2)
+            return True
+
+        self.points.append(p2)
+
+        if len(self.points) > self.max_triangles and self.depth < self.max_depth:
+            self.subdivide()
+            self._redistribute()
+            self._redistribute_points()
+
+        return True
+
+    def get_bounding_boxes(self) -> list[tuple[float, float, float, float, float, float]]:
+        """Return all node bounds with a flattened Z range for wireframe rendering."""
+        out = [
+            (
+                float(self.aabb_min[0]),
+                float(self.aabb_max[0]),
+                float(self.aabb_min[1]),
+                float(self.aabb_max[1]),
+                0.0,
+                0.0,
+            )
+        ]
+        if self.children is not None:
+            for child in self.children:
+                out.extend(child.get_bounding_boxes())
+        return out
 
     def insert_many(self, triangles: Iterable[ArrayF]) -> None:
         for tri in triangles:

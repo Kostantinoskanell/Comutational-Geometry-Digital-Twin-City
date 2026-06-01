@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -58,8 +59,8 @@ def build_candidate_grid_points(
 
 def build_sidewalk_polygon_from_street_graph(
     street_graph: nx.MultiDiGraph,
-    road_buffer_m: float = 3.0,
-    sidewalk_buffer_m: float = 5.0,
+    road_buffer_m: float = 4.0,
+    sidewalk_buffer_m: float = 6.0,
 ) -> BaseGeometry | None:
     """Construct sidewalk polygon from centerline buffers (sidewalk ring minus road)."""
     if road_buffer_m <= 0.0:
@@ -141,6 +142,13 @@ class StreetlightGA:
         if self.config.light_radius <= 0:
             raise ValueError("light_radius must be > 0.")
 
+        if self.grid_points.shape[0] < self.config.n_lights:
+            raise ValueError(
+                "n_lights exceeds available sidewalk candidate points "
+                f"({self.config.n_lights} > {self.grid_points.shape[0]}). "
+                "Increase search area or reduce n_lights."
+            )
+
         self.precomputed_coverage: np.ndarray | None = None
         self._grid_index_lookup: Dict[bytes, int] = {
             np.ascontiguousarray(p).tobytes(): int(i) for i, p in enumerate(self.grid_points)
@@ -196,9 +204,22 @@ class StreetlightGA:
         return lookup
 
     def _build_grid_points(self) -> np.ndarray:
+        # Fallback to full ground mesh bounds if sidewalk polygon is unavailable
+        if self.sidewalk_polygon is None or self.sidewalk_polygon.is_empty:
+            # Use full ground mesh bounds without sidewalk filtering
+            min_x, min_y = self.bounds_min
+            max_x, max_y = self.bounds_max
+            return build_candidate_grid_points(
+                bounds_min_xy=np.array([min_x, min_y], dtype=float),
+                bounds_max_xy=np.array([max_x, max_y], dtype=float),
+                grid_step=self.config.grid_step,
+                sidewalk_polygon=None,
+            )
+
+        min_x, min_y, max_x, max_y = self.sidewalk_polygon.bounds
         return build_candidate_grid_points(
-            bounds_min_xy=self.bounds_min,
-            bounds_max_xy=self.bounds_max,
+            bounds_min_xy=np.array([min_x, min_y], dtype=float),
+            bounds_max_xy=np.array([max_x, max_y], dtype=float),
             grid_step=self.config.grid_step,
             sidewalk_polygon=self.sidewalk_polygon,
         )
@@ -312,7 +333,7 @@ class StreetlightGA:
         n_grid = self.grid_points.shape[0]
         n_lights = self.config.n_lights
 
-        sel = self.rng.choice(n_grid, size=n_lights, replace=True)
+        sel = self.rng.choice(n_grid, size=n_lights, replace=False)
         return np.asarray(sel, dtype=np.int64)
 
     def _initialize_population(self) -> np.ndarray:
@@ -320,15 +341,49 @@ class StreetlightGA:
 
     def _tournament_select(self, population: np.ndarray, costs: np.ndarray) -> np.ndarray:
         k = max(2, int(self.config.tournament_k))
-        idxs = self.rng.choice(population.shape[0], size=k, replace=False)
+        replace = population.shape[0] < k
+        idxs = self.rng.choice(population.shape[0], size=k, replace=replace)
         best = idxs[np.argmin(costs[idxs])]
         return np.array(population[best], dtype=np.int64, copy=True)
+
+    def _repair_unique_indices(self, individual: np.ndarray) -> np.ndarray:
+        """Ensure each chromosome uses distinct candidate rows (no duplicate lights)."""
+        out = np.asarray(individual, dtype=np.int64).copy()
+        if out.ndim != 1 or out.shape[0] != self.config.n_lights:
+            raise ValueError("individual must have shape (n_lights,).")
+
+        n_grid = int(self.grid_points.shape[0])
+        if n_grid <= 0:
+            raise ValueError("No grid points available.")
+
+        np.clip(out, 0, n_grid - 1, out=out)
+        unique_vals, first_idx = np.unique(out, return_index=True)
+        if unique_vals.shape[0] == out.shape[0]:
+            return out
+
+        keep = np.zeros((out.shape[0],), dtype=bool)
+        keep[first_idx] = True
+
+        missing = np.setdiff1d(np.arange(n_grid, dtype=np.int64), unique_vals, assume_unique=False)
+        self.rng.shuffle(missing)
+        mptr = 0
+
+        for i in range(out.shape[0]):
+            if keep[i]:
+                continue
+            if mptr < missing.shape[0]:
+                out[i] = missing[mptr]
+                mptr += 1
+            else:
+                out[i] = int(self.rng.integers(0, n_grid))
+
+        return out
 
     def _crossover(self, parent_a: np.ndarray, parent_b: np.ndarray) -> np.ndarray:
         mask = self.rng.random(self.config.n_lights) < 0.5
         child = np.array(parent_a, dtype=np.int64, copy=True)
         child[mask] = parent_b[mask]
-        return child
+        return self._repair_unique_indices(child)
 
     def _mutate(self, individual: np.ndarray) -> np.ndarray:
         out = np.array(individual, dtype=np.int64, copy=True)
@@ -336,9 +391,21 @@ class StreetlightGA:
             if self.rng.random() < self.config.mutation_rate:
                 gidx = self.rng.integers(0, self.grid_points.shape[0])
                 out[i] = int(gidx)
-        return out
+        return self._repair_unique_indices(out)
 
-    def _evaluate_population_costs(self, population: np.ndarray) -> np.ndarray:
+    def _evaluate_population_costs_chunk(self, pop_chunk: np.ndarray, weighted_areas: np.ndarray) -> np.ndarray:
+        counts = np.sum(self.precomputed_coverage[pop_chunk], axis=1, dtype=np.int32)  # FIXED: int16→int32 prevents overflow for K>32767
+        dark_mask = counts == 0
+        double_mask = counts >= 2
+        area_dark = dark_mask @ weighted_areas
+        area_double_lit = double_mask @ self.areas
+        return self.config.w1_dark * area_dark + self.config.w2_double_lit * area_double_lit
+
+    def _evaluate_population_costs(
+        self,
+        population: np.ndarray,
+        executor: cf.Executor | None = None,
+    ) -> np.ndarray:
         if self.precomputed_coverage is None:
             raise ValueError("Precomputed coverage matrix is required for cost evaluation.")
 
@@ -349,17 +416,28 @@ class StreetlightGA:
         if np.any(pop < 0) or np.any(pop >= self.precomputed_coverage.shape[0]):
             raise ValueError("population contains out-of-range grid row indices.")
 
-        # Coverage gather: (P, N, K) -> counts (P, K), where:
-        # P = population size, N = n_lights, K = triangles.
-        counts = np.sum(self.precomputed_coverage[pop], axis=1, dtype=np.int16)
-        dark_mask = counts == 0
-        double_mask = counts >= 2
-
         weighted_areas = self.areas * self.weights
-        area_dark = dark_mask @ weighted_areas
-        area_double_lit = double_mask @ self.areas
+        workers = max(1, int(self.config.fitness_workers))
 
-        return self.config.w1_dark * area_dark + self.config.w2_double_lit * area_double_lit
+        if workers <= 1 or pop.shape[0] < max(8, workers * 2):
+            return self._evaluate_population_costs_chunk(pop, weighted_areas)
+
+        chunks = [chunk for chunk in np.array_split(pop, workers) if chunk.shape[0] > 0]
+        if not chunks:
+            return np.empty((0,), dtype=float)
+
+        if executor is None:
+            with cf.ThreadPoolExecutor(max_workers=workers) as local_executor:
+                futures = [
+                    local_executor.submit(self._evaluate_population_costs_chunk, chunk, weighted_areas)
+                    for chunk in chunks
+                ]
+                parts = [f.result() for f in futures]
+        else:
+            futures = [executor.submit(self._evaluate_population_costs_chunk, chunk, weighted_areas) for chunk in chunks]
+            parts = [f.result() for f in futures]
+
+        return np.concatenate(parts, axis=0)
 
     def optimize(self) -> Tuple[np.ndarray, float, np.ndarray]:
         """Run GA and return (best_positions, best_cost, history)."""
@@ -370,44 +448,54 @@ class StreetlightGA:
         best_cost = np.inf
         t0 = time.perf_counter()
         progress_every = max(1, int(self.config.progress_every))
+        workers = max(1, int(self.config.fitness_workers))
+        use_parallel_fitness = workers > 1 and self.config.population_size >= max(8, workers * 2)
+        fitness_executor: cf.ThreadPoolExecutor | None = None
+        if use_parallel_fitness:
+            fitness_executor = cf.ThreadPoolExecutor(max_workers=workers)
 
-        for gen in range(self.config.generations):
-            costs = self._evaluate_population_costs(population)
+        try:
+            for gen in range(self.config.generations):
+                costs = self._evaluate_population_costs(population, executor=fitness_executor)
 
-            gen_best_idx = int(np.argmin(costs))
-            gen_best_cost = float(costs[gen_best_idx])
-            history[gen] = gen_best_cost
+                gen_best_idx = int(np.argmin(costs))
+                gen_best_cost = float(costs[gen_best_idx])
+                history[gen] = gen_best_cost
 
-            if gen_best_cost < best_cost:
-                best_cost = gen_best_cost
-                best_indices = np.array(population[gen_best_idx], dtype=np.int64, copy=True)
+                if gen_best_cost < best_cost:
+                    best_cost = gen_best_cost
+                    best_indices = np.array(population[gen_best_idx], dtype=np.int64, copy=True)
 
-            elite_count = max(0, min(self.config.elitism, self.config.population_size))
-            elites = np.argsort(costs)[:elite_count]
-            next_pop: list[np.ndarray] = [
-                np.array(population[i], dtype=np.int64, copy=True) for i in elites
-            ]
+                elite_count = max(0, min(self.config.elitism, self.config.population_size))
+                elites = np.argsort(costs)[:elite_count]
+                next_pop: list[np.ndarray] = [
+                    np.array(population[i], dtype=np.int64, copy=True) for i in elites
+                ]
 
-            while len(next_pop) < self.config.population_size:
-                p1 = self._tournament_select(population, costs)
-                p2 = self._tournament_select(population, costs)
-                child = self._crossover(p1, p2)
-                child = self._mutate(child)
-                next_pop.append(child)
+                while len(next_pop) < self.config.population_size:
+                    p1 = self._tournament_select(population, costs)
+                    p2 = self._tournament_select(population, costs)
+                    child = self._crossover(p1, p2)
+                    child = self._mutate(child)
+                    next_pop.append(child)
 
-            population = np.array(next_pop, dtype=np.int64)
+                population = np.array(next_pop, dtype=np.int64)
 
-            if self.config.verbose and (
-                gen == 0
-                or ((gen + 1) % progress_every == 0)
-                or (gen + 1 == self.config.generations)
-            ):
-                elapsed = time.perf_counter() - t0
-                print(
-                    f"GA progress {gen + 1:>3}/{self.config.generations}: "
-                    f"gen_best={gen_best_cost:.6f}, global_best={best_cost:.6f}, "
-                    f"elapsed={elapsed:.1f}s"
-                )
+                if self.config.verbose and (
+                    gen == 0
+                    or ((gen + 1) % progress_every == 0)
+                    or (gen + 1 == self.config.generations)
+                ):
+                    elapsed = time.perf_counter() - t0
+                    worker_msg = f", fitness_workers={workers}" if use_parallel_fitness else ""
+                    print(
+                        f"GA progress {gen + 1:>3}/{self.config.generations}: "
+                        f"gen_best={gen_best_cost:.6f}, global_best={best_cost:.6f}, "
+                        f"elapsed={elapsed:.1f}s{worker_msg}"
+                    )
+        finally:
+            if fitness_executor is not None:
+                fitness_executor.shutdown(wait=True)
 
         return best_indices, best_cost, history
 
@@ -430,7 +518,6 @@ def optimize_streetlights(
     precomputed_coverage_matrix: np.ndarray | None = None,
     street_graph: nx.MultiDiGraph | None = None,
     sidewalk_polygon: BaseGeometry | None = None,
-    spotlight_half_angle_deg: float = 45.0,
     ga_jobs: int = 1,
     ga_progress_every: int = 5,
     ga_verbose: bool = False,
@@ -454,6 +541,8 @@ def optimize_streetlights(
     resolved_sidewalk_polygon = sidewalk_polygon
     if resolved_sidewalk_polygon is None and street_graph is not None:
         resolved_sidewalk_polygon = build_sidewalk_polygon_from_street_graph(street_graph)
+    # Fallback allowed: if sidewalk_polygon is still None or empty, 
+    # StreetlightGA will use the full ground mesh bounds with street-proximity weighting.
 
     solver = StreetlightGA(
         ground_mesh=ground_mesh,
@@ -463,9 +552,10 @@ def optimize_streetlights(
 
     if precomputed_coverage_matrix is not None:
         solver.set_precomputed_coverage(precomputed_coverage_matrix)
-    elif use_precomputed_coverage:
+    else:
+        # Always use coverage matrix with LOS checks (no pure-radius fallback)
         if octree_root is None:
-            raise ValueError("octree_root is required when use_precomputed_coverage=True.")
+            raise ValueError("octree_root is required for coverage matrix computation.")
         coverage = build_coverage_matrix(
             grid_points=solver.grid_points,
             ground_mesh=ground_mesh,
@@ -473,15 +563,16 @@ def optimize_streetlights(
             radius=light_radius,
             pole_height=pole_height,
             street_graph=street_graph,
-            spotlight_half_angle_deg=spotlight_half_angle_deg,
         )
         solver.set_precomputed_coverage(coverage)
-    else:
-        # Fallback matrix: geometric radius-only coverage (no LOS blockers).
-        solver.set_precomputed_coverage(solver.build_radius_coverage_matrix())
 
     if ground_weights is not None:
         solver.set_triangle_weights(ground_weights)
+    elif street_graph is not None:
+        # Auto-compute street-proximity weights when not provided
+        auto_weights = compute_ground_weights(ground_mesh, street_graph, max_dist=15.0)
+        if auto_weights.shape[0] == solver.weights.shape[0]:
+            solver.set_triangle_weights(auto_weights)
 
     best_indices, best_cost, history = solver.optimize()
     best_positions = solver.grid_points[best_indices]
@@ -587,8 +678,16 @@ def compute_ground_weights(
         return np.ones((centroids_xy.shape[0],), dtype=float)
 
     weights = np.ones((centroids_xy.shape[0],), dtype=float)
-    for i, cxy in enumerate(centroids_xy):
-        if _min_distance_point_to_segments(cxy, seg_starts, seg_ends) <= max_dist + EPS:
-            weights[i] = 10.0
-
+    # FIXED: replace O(N×M) Python loop with cKDTree pre-filter + exact check only on candidates
+    from scipy.spatial import cKDTree
+    seg_mids = (seg_starts + seg_ends) * 0.5
+    tree = cKDTree(seg_mids)
+    # 2× max_dist conservative bound: catches segments whose midpoint is far but endpoint is close
+    candidate_mask = np.zeros(centroids_xy.shape[0], dtype=bool)
+    idxs = tree.query_ball_point(centroids_xy, r=max_dist * 2.0 + EPS)
+    rough_candidates = np.where([len(x) > 0 for x in idxs])[0]
+    for i in rough_candidates:
+        if _min_distance_point_to_segments(centroids_xy[i], seg_starts, seg_ends) <= max_dist + EPS:
+            candidate_mask[i] = True
+    weights[candidate_mask] = 10.0
     return weights

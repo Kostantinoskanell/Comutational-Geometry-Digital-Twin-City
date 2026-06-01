@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--radius",
         type=float,
-        default=150.0,
+        default=250.0,
         help="Search radius in meters.",
     )
     parser.add_argument(
@@ -43,6 +43,24 @@ def parse_args() -> argparse.Namespace:
         help="Sun direction vector for shadow mode.",
     )
     parser.add_argument("--n-lights", type=int, default=12, help="Number of streetlights for GA mode.")
+    parser.add_argument("--n-cars", type=int, default=24, help="Number of animated cars in view mode.")
+    parser.add_argument(
+        "--car-detail",
+        choices=["ultra", "low"],
+        default="ultra",
+        help="Car rendering detail: ultra (point sprites) or low (cuboids).",
+    )
+    parser.add_argument(
+        "--traffic-speed",
+        type=float,
+        default=1.0,
+        help="Traffic speed multiplier for animated cars (1.0 = default).",
+    )
+    parser.add_argument(
+        "--debug-cars",
+        action="store_true",
+        help="Print car loading/runtime debug logs to terminal.",
+    )
     parser.add_argument("--light-radius", type=float, default=40.0, help="Streetlight illumination radius.")
     parser.add_argument("--w1", type=float, default=1.0, help="Weight for dark area term.")
     parser.add_argument("--w2", type=float, default=0.5, help="Weight for double-lit area term.")
@@ -111,11 +129,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run GA optimization before opening the interactive viewer.",
     )
+    parser.add_argument(
+        "--show-cars",
+        dest="show_cars",
+        action="store_true",
+        default=True,
+        help="Show animated car traffic in the viewer (default: enabled).",
+    )
+    parser.add_argument(
+        "--hide-cars",
+        dest="show_cars",
+        action="store_false",
+        help="Hide animated car traffic in the viewer.",
+    )
+    parser.add_argument(
+        "--data-source",
+        choices=["overture", "osm"],
+        default="overture",
+        help="Data source for buildings and street graph (default: overture).",
+    )
     return parser.parse_args()
 
 
 def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
-    """Optional Tkinter form for parameter input before execution."""
+    """Styled Tkinter parameter form for City Digital Twin."""
     try:
         import tkinter as tk
         from tkinter import ttk
@@ -123,42 +160,174 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
         print("GUI input unavailable (tkinter not found). Continuing with CLI args.")
         return args
 
+    # ── Palette ───────────────────────────────────────────────────────────────
+    BG         = "#1e2130"
+    PANEL      = "#262c3f"
+    ACCENT     = "#4fc3f7"
+    TEXT       = "#e8eaf6"
+    SUBTEXT    = "#90caf9"
+    BTN_RUN    = "#00bfa5"
+    BTN_CANCEL = "#546e7a"
+    FIELD_BG   = "#2e3450"
+    TROUGH     = "#3a4060"
+
     root = tk.Tk()
-    root.title("Mini Motorways Lighting Setup")
-    root.geometry("520x460")
+    root.title("City Digital Twin")
+    root.geometry("600x500")
+    root.minsize(540, 440)
+    root.configure(bg=BG)
 
-    address_var = tk.StringVar(value=str(args.address))
-    radius_var = tk.StringVar(value=str(args.radius))
-    lights_var = tk.StringVar(value=str(args.n_lights))
-    light_radius_var = tk.StringVar(value=str(args.light_radius))
-    coverage_jobs_var = tk.StringVar(value=str(args.coverage_jobs))
-    ga_jobs_var = tk.StringVar(value=str(args.ga_jobs))
-    mode_var = tk.StringVar(value=str(args.mode))
-    fast_var = tk.BooleanVar(value=bool(args.fast_startup))
-    roads_var = tk.BooleanVar(value=not bool(args.hide_roads))
+    # ── Theme & Styles ────────────────────────────────────────────────────────
+    style = ttk.Style(root)
+    style.theme_use("clam")
 
-    frame = ttk.Frame(root, padding=12)
-    frame.pack(fill="both", expand=True)
+    style.configure("BG.TFrame",          background=BG)
+    style.configure("TFrame",             background=PANEL)
+    style.configure("TLabel",             background=PANEL, foreground=TEXT,    font=("Helvetica", 10))
+    style.configure("Sub.TLabel",         background=PANEL, foreground=SUBTEXT, font=("Helvetica", 9))
+    style.configure("Info.TLabel",        background=BG,    foreground=SUBTEXT, font=("Helvetica", 9))
+    style.configure("TEntry",             fieldbackground=FIELD_BG, foreground=TEXT, insertcolor=TEXT,
+                                          bordercolor=ACCENT, lightcolor=PANEL, darkcolor=PANEL)
+    style.configure("TCombobox",          fieldbackground=FIELD_BG, foreground=TEXT,
+                                          selectbackground=ACCENT,  selectforeground=BG,
+                                          bordercolor=ACCENT, arrowcolor=ACCENT)
+    style.map("TCombobox",                fieldbackground=[("readonly", FIELD_BG)],
+                                          foreground=[("readonly", TEXT)])
+    style.configure("TCheckbutton",       background=PANEL, foreground=TEXT)
+    style.map("TCheckbutton",             background=[("active", PANEL)], foreground=[("active", ACCENT)])
+    style.configure("TRadiobutton",       background=PANEL, foreground=TEXT)
+    style.map("TRadiobutton",             background=[("active", PANEL)], foreground=[("active", ACCENT)])
+    style.configure("Horizontal.TScale",  background=PANEL, troughcolor=TROUGH,
+                                          sliderlength=18,   sliderrelief="flat")
+    style.map("Horizontal.TScale",        background=[("active", ACCENT)])
+    style.configure("TNotebook",          background=BG, tabmargins=[2, 4, 2, 0])
+    style.configure("TNotebook.Tab",      background=PANEL, foreground=SUBTEXT,
+                                          padding=[10, 4], font=("Helvetica", 10, "bold"))
+    style.map("TNotebook.Tab",            background=[("selected", ACCENT)],
+                                          foreground=[("selected", BG)])
+    style.configure("TLabelframe",        background=PANEL, foreground=ACCENT, bordercolor=ACCENT)
+    style.configure("TLabelframe.Label",  background=PANEL, foreground=ACCENT,
+                                          font=("Helvetica", 9, "bold"))
+    style.configure("Run.TButton",        background=BTN_RUN,    foreground=BG,
+                                          font=("Helvetica", 10, "bold"), borderwidth=0, padding=[14, 6])
+    style.map("Run.TButton",              background=[("active", "#26a69a")])
+    style.configure("Cancel.TButton",     background=BTN_CANCEL, foreground=TEXT,
+                                          font=("Helvetica", 10),        borderwidth=0, padding=[14, 6])
+    style.map("Cancel.TButton",           background=[("active", "#607d8b")])
 
-    def _row(lbl: str, widget: Any, r: int) -> None:
-        ttk.Label(frame, text=lbl).grid(row=r, column=0, sticky="w", padx=4, pady=5)
-        widget.grid(row=r, column=1, sticky="ew", padx=4, pady=5)
+    # ── Variables ─────────────────────────────────────────────────────────────
+    address_var      = tk.StringVar(value=str(args.address))
+    radius_var       = tk.StringVar(value=str(int(float(args.radius))))
+    mode_var         = tk.StringVar(value=str(args.mode))
+    data_source_var  = tk.StringVar(value=str(getattr(args, "data_source", "overture")))
+    fast_var         = tk.BooleanVar(value=bool(args.fast_startup))
+    optimize_var     = tk.BooleanVar(value=bool(getattr(args, "optimize_on_open", False)))
 
-    frame.columnconfigure(1, weight=1)
-    _row("Address", ttk.Entry(frame, textvariable=address_var), 0)
-    _row("Radius (m)", ttk.Entry(frame, textvariable=radius_var), 1)
-    _row("Mode", ttk.Combobox(frame, textvariable=mode_var, values=["view", "shadow", "ga", "all"], state="readonly"), 2)
-    _row("Streetlights (N)", ttk.Entry(frame, textvariable=lights_var), 3)
-    _row("Spotlight Radius", ttk.Entry(frame, textvariable=light_radius_var), 4)
-    _row("Coverage Jobs", ttk.Entry(frame, textvariable=coverage_jobs_var), 5)
-    _row("GA Jobs", ttk.Entry(frame, textvariable=ga_jobs_var), 6)
+    cars_var         = tk.StringVar(value=str(int(args.n_cars)))
+    car_detail_var   = tk.StringVar(value=str(args.car_detail))
+    traffic_var      = tk.StringVar(value=str(float(args.traffic_speed)))
+    roads_var        = tk.BooleanVar(value=not bool(args.hide_roads))
+    show_cars_var    = tk.BooleanVar(value=bool(getattr(args, "show_cars", True)))
 
-    ttk.Checkbutton(frame, text="Fast Startup (cache + lower res)", variable=fast_var).grid(
-        row=7, column=0, columnspan=2, sticky="w", padx=4, pady=4
+    lights_var       = tk.StringVar(value=str(int(args.n_lights)))
+    light_radius_var = tk.StringVar(value=str(int(float(args.light_radius))))
+    cov_jobs_var     = tk.StringVar(value=str(int(args.coverage_jobs)))
+    ga_jobs_var      = tk.StringVar(value=str(int(args.ga_jobs)))
+
+    # ── Entry row helper ──────────────────────────────────────────────────────
+    def _entry_row(
+        parent: "ttk.Frame",
+        label: str,
+        var: "tk.Variable",
+        hint: str,
+        row: int,
+    ) -> None:
+        """Render a label | entry | hint-label row."""
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(8, 4), pady=5)
+        ttk.Entry(parent, textvariable=var, font=("Helvetica", 10), width=10).grid(
+            row=row, column=1, sticky="ew", padx=4, pady=5
+        )
+        ttk.Label(parent, text=hint, style="Sub.TLabel").grid(
+            row=row, column=2, sticky="w", padx=(2, 8), pady=5
+        )
+
+    # ── Outer shell ───────────────────────────────────────────────────────────
+    outer = ttk.Frame(root, style="BG.TFrame", padding=10)
+    outer.pack(fill="both", expand=True)
+
+    notebook = ttk.Notebook(outer)
+    notebook.pack(fill="both", expand=True, pady=(0, 6))
+
+    # ── TAB 1: Location & Source ──────────────────────────────────────────────
+    tab1 = ttk.Frame(notebook, padding=10)
+    tab1.columnconfigure(1, weight=1)
+    notebook.add(tab1, text="\U0001f4cd Location & Source")
+
+    ttk.Label(tab1, text="Address").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=5)
+    ttk.Entry(tab1, textvariable=address_var, font=("Helvetica", 10)).grid(
+        row=0, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=5
     )
-    ttk.Checkbutton(frame, text="Show Roads", variable=roads_var).grid(
-        row=8, column=0, columnspan=2, sticky="w", padx=4, pady=4
+    ttk.Label(tab1, text="Radius (m)").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=5)
+    ttk.Entry(tab1, textvariable=radius_var, font=("Helvetica", 10)).grid(
+        row=1, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=5
     )
+    ttk.Label(tab1, text="Mode").grid(row=2, column=0, sticky="w", padx=(8, 4), pady=5)
+    ttk.Combobox(
+        tab1, textvariable=mode_var, values=["view", "shadow", "ga", "all"], state="readonly"
+    ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=5)
+
+    src_frame = ttk.LabelFrame(tab1, text="Map data source", padding=8)
+    src_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=6)
+    ttk.Radiobutton(src_frame, text="\u25c9  Overture Maps",    variable=data_source_var, value="overture").pack(side="left", padx=14)
+    ttk.Radiobutton(src_frame, text="\u25ef  OpenStreetMap",    variable=data_source_var, value="osm").pack(side="left", padx=14)
+
+    ttk.Checkbutton(tab1, text="Fast Startup  (cache + lower res)",         variable=fast_var).grid(
+        row=4, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+    ttk.Checkbutton(tab1, text="Optimize on Open  (run GA before viewer)",  variable=optimize_var).grid(
+        row=5, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+
+    # ── TAB 2: Traffic ────────────────────────────────────────────────────────
+    tab2 = ttk.Frame(notebook, padding=10)
+    tab2.columnconfigure(1, weight=1)
+    notebook.add(tab2, text="\U0001f697 Traffic")
+
+    _entry_row(tab2, "Cars (N)",          cars_var,    "0 – 60",   row=0)
+    ttk.Label(tab2, text="Car Detail").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=5)
+    ttk.Combobox(
+        tab2, textvariable=car_detail_var, values=["ultra", "low"], state="readonly"
+    ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=5)
+    _entry_row(tab2, "Traffic Speed (\u00d7)", traffic_var, "e.g. 1.0",  row=2)
+    ttk.Checkbutton(tab2, text="Show Roads", variable=roads_var).grid(
+        row=3, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+    ttk.Checkbutton(tab2, text="Show Cars",  variable=show_cars_var).grid(
+        row=4, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+
+    # ── TAB 3: Lighting ───────────────────────────────────────────────────────
+    tab3 = ttk.Frame(notebook, padding=10)
+    tab3.columnconfigure(1, weight=1)
+    notebook.add(tab3, text="\U0001f4a1 Lighting")
+
+    _entry_row(tab3, "Streetlights (N)",  lights_var,       "2 – 40",    row=0)
+    _entry_row(tab3, "Spotlight Radius",   light_radius_var, "10 – 100 m", row=1)
+    _entry_row(tab3, "Coverage Jobs",      cov_jobs_var,     "1 – 16",     row=2)
+    _entry_row(tab3, "GA Jobs",            ga_jobs_var,      "1 – 16",     row=3)
+
+    # ── Bottom bar ────────────────────────────────────────────────────────────
+    bar = ttk.Frame(outer, style="BG.TFrame", padding=(8, 4))
+    bar.pack(fill="x", side="bottom")
+    bar.columnconfigure(0, weight=1)
+
+    info_label = ttk.Label(bar, style="Info.TLabel")
+    info_label.grid(row=0, column=0, sticky="w")
+
+    def _on_source_change(*_: object) -> None:
+        if data_source_var.get() == "overture":
+            info_label.config(text="\u2139  Overture: validated buildings + streets from cloud")
+        else:
+            info_label.config(text="\u2139  OSM: community data via OSMnx (requires internet)")
+
+    data_source_var.trace_add("write", _on_source_change)
+    _on_source_change()
 
     result = {"ok": False}
 
@@ -169,25 +338,31 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
     def _cancel() -> None:
         root.destroy()
 
-    btns = ttk.Frame(frame)
-    btns.grid(row=9, column=0, columnspan=2, sticky="e", pady=8)
-    ttk.Button(btns, text="Cancel", command=_cancel).pack(side="right", padx=6)
-    ttk.Button(btns, text="Run", command=_run).pack(side="right")
+    btn_frame = ttk.Frame(bar, style="BG.TFrame")
+    btn_frame.grid(row=0, column=1, sticky="e")
+    ttk.Button(btn_frame, text="Cancel",    style="Cancel.TButton", command=_cancel).pack(side="left", padx=(0, 6))
+    ttk.Button(btn_frame, text="\u25b6  Run", style="Run.TButton",    command=_run).pack(side="left")
 
     root.mainloop()
     if not result["ok"]:
         return args
 
     try:
-        args.address = address_var.get().strip() or args.address
-        args.radius = float(radius_var.get())
-        args.mode = mode_var.get().strip() or args.mode
-        args.n_lights = int(lights_var.get())
-        args.light_radius = float(light_radius_var.get())
-        args.coverage_jobs = int(coverage_jobs_var.get())
-        args.ga_jobs = int(ga_jobs_var.get())
-        args.fast_startup = bool(fast_var.get())
-        args.hide_roads = not bool(roads_var.get())
+        args.address          = address_var.get().strip() or args.address
+        args.radius           = float(radius_var.get())
+        args.mode             = mode_var.get().strip() or args.mode
+        args.data_source      = data_source_var.get()
+        args.fast_startup     = bool(fast_var.get())
+        args.optimize_on_open = bool(optimize_var.get())
+        args.n_cars           = int(cars_var.get())
+        args.car_detail       = car_detail_var.get().strip() or args.car_detail
+        args.traffic_speed    = round(float(traffic_var.get()), 1)
+        args.hide_roads       = not bool(roads_var.get())
+        args.show_cars        = bool(show_cars_var.get())
+        args.n_lights         = int(lights_var.get())
+        args.light_radius     = float(light_radius_var.get())
+        args.coverage_jobs    = int(cov_jobs_var.get())
+        args.ga_jobs          = int(ga_jobs_var.get())
     except Exception as exc:
         print(f"Invalid GUI input ({exc}). Using previous arguments.")
 

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import os
+import time
 from typing import Tuple
 
 import networkx as nx
 import numpy as np
 import pyvista as pv
-from numba import njit, prange
+from numba import njit, prange, set_num_threads
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
@@ -29,6 +30,8 @@ _COV_BUILDING_AABB_MINS: np.ndarray | None = None
 _COV_BUILDING_AABB_MAXS: np.ndarray | None = None
 _GROUND_TRI_CACHE: dict[tuple[int, int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 _NUMBA_KERNELS_READY = False
+import threading as _threading
+_NUMBA_WARMUP_LOCK = _threading.Lock()
 
 
 # ============================================================================
@@ -213,10 +216,7 @@ def _compute_spotlight_coverage_numba(
 
         ray_dir = ray_vec / ray_len
 
-        # Cone check: reject triangles outside angular cone
-        if np.dot(ray_dir, orientation) < cone_cosine:
-            continue
-
+        # Omnidirectional: no cone restriction (removed spotlight_half_angle check)
         blocked = False
         for j in range(n_building):
             if not _ray_aabb_intersection_numba(
@@ -246,36 +246,39 @@ def _warmup_numba_kernels() -> None:
     global _NUMBA_KERNELS_READY
     if _NUMBA_KERNELS_READY:
         return
+    with _NUMBA_WARMUP_LOCK:
+        if _NUMBA_KERNELS_READY:  # double-checked locking
+            return
 
-    centroids = np.array([[0.0, 0.0, 0.0]], dtype=np.float64)
-    areas = np.array([1.0], dtype=np.float64)
-    ray_dir = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    building_triangles = np.array([[[10.0, 0.0, 0.0], [11.0, 0.0, 0.0], [10.0, 1.0, 0.0]]], dtype=np.float64)
-    tri_mins = np.min(building_triangles, axis=1)
-    tri_maxs = np.max(building_triangles, axis=1)
+        centroids = np.array([[0.0, 0.0, 0.0]], dtype=np.float64)
+        areas = np.array([1.0], dtype=np.float64)
+        ray_dir = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        building_triangles = np.array([[[10.0, 0.0, 0.0], [11.0, 0.0, 0.0], [10.0, 1.0, 0.0]]], dtype=np.float64)
+        tri_mins = np.min(building_triangles, axis=1)
+        tri_maxs = np.max(building_triangles, axis=1)
 
-    _compute_shadows_numba(
-        centroids,
-        areas,
-        ray_dir,
-        building_triangles,
-        tri_mins,
-        tri_maxs,
-    )
+        _compute_shadows_numba(
+            centroids,
+            areas,
+            ray_dir,
+            building_triangles,
+            tri_mins,
+            tri_maxs,
+        )
 
-    illuminated = np.zeros((1,), dtype=np.bool_)
-    _compute_spotlight_coverage_numba(
-        np.array([0.0, 0.0, 3.0], dtype=np.float64),
-        centroids,
-        np.array([0.0, 0.0, -1.0], dtype=np.float64),
-        -1.0,
-        building_triangles,
-        tri_mins,
-        tri_maxs,
-        np.array([0], dtype=np.int64),
-        illuminated,
-    )
-    _NUMBA_KERNELS_READY = True
+        illuminated = np.zeros((1,), dtype=np.bool_)
+        _compute_spotlight_coverage_numba(
+            np.array([0.0, 0.0, 3.0], dtype=np.float64),
+            centroids,
+            np.array([0.0, 0.0, -1.0], dtype=np.float64),
+            -1.0,
+            building_triangles,
+            tri_mins,
+            tri_maxs,
+            np.array([0], dtype=np.int64),
+            illuminated,
+        )
+        _NUMBA_KERNELS_READY = True
 
 
 def _auto_chunk_size(n_rows: int, n_jobs: int) -> int:
@@ -285,10 +288,14 @@ def _auto_chunk_size(n_rows: int, n_jobs: int) -> int:
     if n_jobs <= 1:
         return max(1, n_rows)
 
+    if n_rows <= n_jobs * 8:
+        # Keep tiny workloads highly divisible to saturate workers.
+        return 1
+
     target_tasks_per_worker = 8
     tasks = max(1, n_jobs * target_tasks_per_worker)
     chunk = int(np.ceil(n_rows / tasks))
-    return int(max(8, min(512, chunk)))
+    return int(max(4, min(512, chunk)))
 
 
 def _extract_ground_triangles_and_areas(ground_mesh: pv.PolyData) -> Tuple[np.ndarray, np.ndarray]:
@@ -517,7 +524,7 @@ def compute_shadows(
     building_aabb_mins, building_aabb_maxs = _extract_building_triangle_aabbs(octree_root, building_triangles)
     
     print(f"Computing shadows for {n_tris} ground triangles with {building_triangles.shape[0]} building triangles...")
-    
+    _t0 = time.perf_counter()
     # Call Numba-compiled function
     shadowed, ratio = _compute_shadows_numba(
         centroids.astype(np.float64),
@@ -528,6 +535,7 @@ def compute_shadows(
         building_aabb_maxs,
     )
 
+    print(f"[shadow] compute_shadows: {time.perf_counter() - _t0:.3f}s for {n_tris} cells")
     return shadowed, ratio
 
 
@@ -538,7 +546,6 @@ def compute_spotlight_coverage(
     ground_mesh: pv.PolyData,
     octree_root,
     street_graph: nx.MultiDiGraph | None = None,
-    spotlight_half_angle_deg: float = 45.0,
 ) -> np.ndarray:
     """Compute ground-triangle illumination for a streetlight (Numba-accelerated).
     
@@ -560,9 +567,7 @@ def compute_spotlight_coverage(
     octree_root : OctreeNode
         Octree storing building triangles.
     street_graph : nx.MultiDiGraph, optional
-        Street network for directional orientation.
-    spotlight_half_angle_deg : float
-        Half-angle of spotlight cone in degrees.
+        Street network (not used for omnidirectional spotlight).
     
     Returns
     -------
@@ -592,11 +597,6 @@ def compute_spotlight_coverage(
 
     illuminated = np.zeros(n_tris, dtype=bool)
 
-    # Extract street segments and compute orientation
-    seg_starts, seg_ends = _extract_street_segments_xy(street_graph)
-    orientation = _spotlight_orientation_vector(light_xy_arr, pole_height, seg_starts, seg_ends)
-    cone_cosine = float(np.cos(np.deg2rad(float(spotlight_half_angle_deg))))
-
     # Extract building triangles for Numba function
     building_triangles = _extract_building_triangles(octree_root)
     building_aabb_mins, building_aabb_maxs = _extract_building_triangle_aabbs(octree_root, building_triangles)
@@ -607,12 +607,16 @@ def compute_spotlight_coverage(
     if candidate_indices.shape[0] > 0 and building_triangles.shape[0] > 0:
         light_pos = np.array([light_xy_arr[0], light_xy_arr[1], float(pole_height)], dtype=np.float64)
         
+        # Omnidirectional: pass dummy orientation and cone_cosine (no cone check in Numba function)
+        dummy_orientation = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        dummy_cone_cosine = -1.0  # Always passes cone check since -1.0 < any dot product
+        
         # Call Numba-compiled parallel function
         _compute_spotlight_coverage_numba(
             light_pos,
             centroids,
-            orientation.astype(np.float64),
-            cone_cosine,
+            dummy_orientation,
+            dummy_cone_cosine,
             building_triangles,
             building_aabb_mins,
             building_aabb_maxs,
@@ -630,7 +634,6 @@ def _init_coverage_worker(
     pole_height: float,
     seg_starts: np.ndarray,
     seg_ends: np.ndarray,
-    cone_cosine: float,
     centroids_xy: np.ndarray,
     building_triangles: np.ndarray,
     building_aabb_mins: np.ndarray,
@@ -640,13 +643,20 @@ def _init_coverage_worker(
     global _COV_GRID, _COV_CENTROIDS, _COV_RADIUS, _COV_POLE_HEIGHT
     global _COV_SEG_STARTS, _COV_SEG_ENDS, _COV_CONE_COSINE, _COV_CENTROID_TREE
     global _COV_BUILDING_TRIANGLES, _COV_BUILDING_AABB_MINS, _COV_BUILDING_AABB_MAXS
+    try:
+        # Process-level parallelism is used here; keep one Numba thread per worker
+        # to avoid severe CPU oversubscription.
+        set_num_threads(1)
+    except Exception:
+        pass
+
     _COV_GRID = grid
     _COV_CENTROIDS = centroids
     _COV_RADIUS = float(radius)
     _COV_POLE_HEIGHT = float(pole_height)
     _COV_SEG_STARTS = seg_starts
     _COV_SEG_ENDS = seg_ends
-    _COV_CONE_COSINE = float(cone_cosine)
+    _COV_CONE_COSINE = -1.0  # Omnidirectional: dummy value (always passes cone check)
     _COV_CENTROID_TREE = cKDTree(np.asarray(centroids_xy, dtype=np.float64))
     _COV_BUILDING_TRIANGLES = building_triangles
     _COV_BUILDING_AABB_MINS = building_aabb_mins
@@ -673,13 +683,13 @@ def _coverage_worker_chunk(row_indices: np.ndarray) -> tuple[np.ndarray, np.ndar
             continue
 
         light_pos = np.array([gp[0], gp[1], _COV_POLE_HEIGHT], dtype=np.float64)
-        orientation = _spotlight_orientation_vector(gp, _COV_POLE_HEIGHT, _COV_SEG_STARTS, _COV_SEG_ENDS)
+        dummy_orientation = np.array([0.0, 0.0, -1.0], dtype=np.float64)  # Omnidirectional
 
         # Call Numba-compiled parallel function per grid point
         _compute_spotlight_coverage_numba(
             light_pos,
             _COV_CENTROIDS,
-            orientation.astype(np.float64),
+            dummy_orientation,
             _COV_CONE_COSINE,
             _COV_BUILDING_TRIANGLES,
             _COV_BUILDING_AABB_MINS,
@@ -698,7 +708,6 @@ def build_coverage_matrix(
     radius: float,
     pole_height: float,
     street_graph: nx.MultiDiGraph | None = None,
-    spotlight_half_angle_deg: float = 45.0,
     n_jobs: int | None = None,
     chunk_size: int | None = None,
 ) -> np.ndarray:
@@ -745,19 +754,45 @@ def build_coverage_matrix(
     centroids = np.asarray(centroids, dtype=np.float64)
     centroids_xy = np.asarray(centroids[:, :2], dtype=np.float64)
     seg_starts, seg_ends = _extract_street_segments_xy(street_graph)
-    cone_cosine = float(np.cos(np.deg2rad(float(spotlight_half_angle_deg))))
     building_triangles = _extract_building_triangles(octree_root)
     building_aabb_mins, building_aabb_maxs = _extract_building_triangle_aabbs(octree_root, building_triangles)
 
     print(f"Extracted {building_triangles.shape[0]} building triangles for LOS checks")
 
+    def _run_serial(into: np.ndarray) -> np.ndarray:
+        tree = cKDTree(centroids_xy)
+        for i in tqdm(range(m), desc="Coverage", unit="gridpoint"):
+            gp = grid[i]
+            cand = np.asarray(tree.query_ball_point(gp, r=radius), dtype=np.int64)
+            if cand.size == 0:
+                continue
+
+            light_pos = np.array([gp[0], gp[1], pole_height], dtype=np.float64)
+            dummy_orientation = np.array([0.0, 0.0, -1.0], dtype=np.float64)  # Omnidirectional
+
+            _compute_spotlight_coverage_numba(
+                light_pos,
+                centroids,
+                dummy_orientation,
+                -1.0,  # Omnidirectional: dummy cone_cosine
+                building_triangles,
+                building_aabb_mins,
+                building_aabb_maxs,
+                cand,
+                into[i],
+            )
+        return into
+
     if n_jobs is None:
         n_jobs = max(1, os.cpu_count() or 1)
     n_jobs = max(1, int(n_jobs))
-    if m <= 64:
-        # For tiny row counts (e.g., ~20 active lights in viewer night mode),
-        # process-spawn overhead dominates; serial path is consistently faster.
-        n_jobs = 1
+    if n_jobs > 1:
+        # Keep only very small workloads on the serial path.
+        # Larger "small-M" workloads (e.g., ~40 lights) can still benefit from
+        # process-level row parallelism.
+        min_rows_for_parallel = max(16, n_jobs * 2)
+        if m < min_rows_for_parallel:
+            n_jobs = 1
     if chunk_size is None:
         chunk_size = _auto_chunk_size(m, n_jobs)
     else:
@@ -765,57 +800,36 @@ def build_coverage_matrix(
 
     if n_jobs == 1:
         print("Running single-worker (serial) coverage computation...")
-        tree = cKDTree(centroids_xy)
-        for i in tqdm(range(m), desc="Coverage", unit="gridpoint"):
-            gp = grid[i]
-            cand = np.asarray(tree.query_ball_point(gp, r=radius), dtype=np.int64)
-            
-            if cand.size == 0:
-                continue
-
-            light_pos = np.array([gp[0], gp[1], pole_height], dtype=np.float64)
-            orientation = _spotlight_orientation_vector(gp, pole_height, seg_starts, seg_ends)
-
-            _compute_spotlight_coverage_numba(
-                light_pos,
-                centroids,
-                orientation.astype(np.float64),
-                cone_cosine,
-                building_triangles,
-                building_aabb_mins,
-                building_aabb_maxs,
-                cand,
-                matrix[i],
-            )
-
-        return matrix
+        return _run_serial(matrix)
 
     # Parallel path with progress bar
     print(f"Running parallel coverage computation with {n_jobs} workers...")
     row_ids = np.arange(m, dtype=np.int64)
     chunks = [row_ids[i : i + chunk_size] for i in range(0, m, chunk_size)]
 
-    with cf.ProcessPoolExecutor(
-        max_workers=n_jobs,
-        initializer=_init_coverage_worker,
-        initargs=(
-            grid,
-            centroids,
-            float(radius),
-            float(pole_height),
-            seg_starts,
-            seg_ends,
-            cone_cosine,
-            centroids_xy,
-            building_triangles,
-            building_aabb_mins,
-            building_aabb_maxs,
-        ),
-    ) as ex:
-        futures = [ex.submit(_coverage_worker_chunk, chunk) for chunk in chunks]
-        
-        for future in tqdm(cf.as_completed(futures), total=len(futures), desc="Coverage chunks"):
-            idx_chunk, sub = future.result()
-            matrix[idx_chunk] = sub
+    try:
+        with cf.ProcessPoolExecutor(
+            max_workers=n_jobs,
+            initializer=_init_coverage_worker,
+            initargs=(
+                grid,
+                centroids,
+                float(radius),
+                float(pole_height),
+                seg_starts,
+                seg_ends,
+                centroids_xy,
+                building_triangles,
+                building_aabb_mins,
+                building_aabb_maxs,
+            ),
+        ) as ex:
+            futures = [ex.submit(_coverage_worker_chunk, chunk) for chunk in chunks]
+            for future in tqdm(cf.as_completed(futures), total=len(futures), desc="Coverage chunks"):
+                idx_chunk, sub = future.result()
+                matrix[idx_chunk] = sub
+    except Exception as exc:
+        print(f"Parallel coverage failed ({exc}); falling back to serial computation...")
+        return _run_serial(matrix)
 
     return matrix

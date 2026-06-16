@@ -28,10 +28,14 @@ build_forbidden_turns(car_paths, car_outgoing, graph) -> set[tuple[int,int]]
 
 from __future__ import annotations
 
+import hashlib
 import math
+import pickle
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+import osmnx as ox
 
 if TYPE_CHECKING:
     import networkx as nx  # noqa: F401
@@ -45,6 +49,84 @@ _PROHIBITING: frozenset[str] = frozenset({
 _MANDATING: frozenset[str] = frozenset({
     "only_left_turn", "only_right_turn", "only_straight_on", "only_u_turn",
 })
+
+
+def _cache_key(*parts: object) -> str:
+    raw = "|".join(str(p) for p in parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def load_osm_direction_graph_cached(
+    bbox_wsen: tuple[float, float, float, float],
+    target_crs,
+    cache_dir: Path | None,
+    use_cache: bool,
+    cache_context_key: str,
+) -> nx.MultiDiGraph:
+    """Fetch and cache an OSM drive graph used only for road-direction lookup."""
+    bbox_wsen = tuple(float(v) for v in bbox_wsen)
+    crs_key = str(target_crs) if target_crs is not None else "default"
+    cache_key = _cache_key("osm-direction", cache_context_key, bbox_wsen, crs_key)
+    cache_path = None if cache_dir is None else cache_dir / f"osm_dir_{cache_key}.pkl"
+
+    if use_cache and cache_path is not None and cache_path.exists():
+        with open(cache_path, "rb") as f:
+            graph = pickle.load(f)
+        print(f"[turn-restr] Loaded OSM direction cache: {cache_path.name}")
+        return graph
+
+    raw = ox.graph_from_bbox(bbox_wsen, network_type="drive", retain_all=True)
+    graph = ox.projection.project_graph(raw, to_crs=target_crs) if target_crs is not None else ox.projection.project_graph(raw)
+    graph.graph["source_bbox_wsen"] = bbox_wsen
+    graph.graph["direction_only"] = True
+
+    if use_cache and cache_path is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(graph, f)
+        print(f"[turn-restr] Saved OSM direction cache: {cache_path.name}")
+
+    return graph
+
+
+def resolve_osm_road_direction(
+    source_start_xy: tuple[float, float],
+    source_end_xy: tuple[float, float],
+    osm_direction_graph,
+) -> tuple[bool, bool]:
+    """Return (is_oneway, legal_forward) using the cached OSM direction graph.
+
+    ``legal_forward`` is True when the source edge's stored direction already
+    matches the legal OSM direction.  If it is False, callers should reverse
+    the geometry before storing the edge so the graph's u→v edge is legal.
+    """
+    if osm_direction_graph is None:
+        return None, None
+
+    try:
+        u_osm = ox.distance.nearest_nodes(
+            osm_direction_graph,
+            X=float(source_start_xy[0]),
+            Y=float(source_start_xy[1]),
+        )
+        v_osm = ox.distance.nearest_nodes(
+            osm_direction_graph,
+            X=float(source_end_xy[0]),
+            Y=float(source_end_xy[1]),
+        )
+    except Exception:
+        return None, None
+
+    forward_exists = bool(osm_direction_graph.has_edge(u_osm, v_osm))
+    reverse_exists = bool(osm_direction_graph.has_edge(v_osm, u_osm))
+
+    if forward_exists and reverse_exists:
+        return False, True
+    if forward_exists:
+        return True, True
+    if reverse_exists:
+        return True, False
+    return None, None
 
 
 # ── Bearing helpers ───────────────────────────────────────────────────────────
@@ -72,10 +154,11 @@ def build_forbidden_turns(
     car_paths:    list[dict],
     car_outgoing: dict,
     graph,
+    include_overture: bool = True,
 ) -> set[tuple[int, int]]:
     """Return a set of (from_path_idx, to_path_idx) pairs that are forbidden.
 
-    Sources tried in order (non-exclusive — both are applied):
+    Sources tried in order when enabled:
 
     1. ``graph.graph['prohibited_turn_pairs']``
        Set of ``(from_segment_id, to_segment_id)`` str pairs stored by
@@ -86,13 +169,14 @@ def build_forbidden_turns(
        Each restriction string is resolved using bearing arithmetic against
        all outgoing edges from the via-node.
 
-    Falls back gracefully to an empty set if neither source has data.
+    ``include_overture=False`` disables source 1.  Falls back gracefully to an
+    empty set if no enabled source has data.
     """
     forbidden: set[tuple[int, int]] = set()
 
     # ── Source 1: Overture prohibited_turn_pairs ──────────────────────────────
-    overture_pairs: set[tuple[str, str]] = graph.graph.get(
-        "prohibited_turn_pairs", set()
+    overture_pairs: set[tuple[str, str]] = (
+        graph.graph.get("prohibited_turn_pairs", set()) if include_overture else set()
     )
     if overture_pairs:
         seg_to_paths: dict[str, list[int]] = {}
@@ -209,8 +293,9 @@ def build_next_edges(
     car_paths:    list[dict],
     car_outgoing: dict,
     graph,
+    include_overture: bool = True,
 ) -> list[np.ndarray]:
-    """Build car_next_edges with all available turn restrictions applied.
+    """Build car_next_edges with enabled turn restrictions applied.
 
     Replacement for the manual loop in main.py:
 
@@ -231,10 +316,16 @@ def build_next_edges(
 
     Filtering order (most permissive → most restrictive):
         1. Non-reverse  — never go straight back the way you came (geometry)
-        2. Explicit turn restrictions (Overture + OSM)
-        Safety net: always keep at least one exit per path to avoid deadlocks.
+        2. Explicit turn restrictions (OSM, plus Overture when enabled)
+        Safety net: keep at least one exit only when filtering restrictions
+        would otherwise remove every candidate.
     """
-    forbidden = build_forbidden_turns(car_paths, car_outgoing, graph)
+    forbidden = build_forbidden_turns(
+        car_paths,
+        car_outgoing,
+        graph,
+        include_overture=include_overture,
+    )
 
     n_restricted = 0
     car_next_edges: list[np.ndarray] = []

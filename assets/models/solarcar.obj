@@ -1,6 +1,6 @@
 # Blender 5.0.0
 # www.blender.org
-mtllib Untitled.mtl
+mtllib solarcar.mtl
 o truck-flat
 v 0.600000 0.312006 0.827365
 v 0.600000 0.323194 0.822731

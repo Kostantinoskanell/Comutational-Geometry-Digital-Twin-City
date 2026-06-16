@@ -8,24 +8,16 @@ from pathlib import Path
 
 import numpy as np
 import pyvista as pv
+import warnings
+try:
+    warnings.filterwarnings("ignore", category=pv.PyVistaFutureWarning)
+except AttributeError:
+    warnings.filterwarnings("ignore", message=".*extract_surface.*")
 
-import os
-_DATA_SOURCE = os.environ.get("CITY_DATA_SOURCE", "overture").lower()
-if _DATA_SOURCE == "osm":
-    from osm_3d_buildings import (
-        build_3d_buildings_and_street_graph,
-        build_road_and_sidewalk_meshes_from_graph,
-    )
-    print("[source] Using OpenStreetMap via OSMnx")
-else:
-    from overture_source import (
-        build_3d_buildings_and_street_graph,
-        build_road_and_sidewalk_meshes_from_graph,
-    )
-    print("[source] Using Overture Maps")
 from shadow_engine import build_coverage_matrix
 from spatial_trees import OctreeNode
 from streetlight_ga import build_candidate_grid_points
+from overture_source import build_road_and_sidewalk_meshes_from_graph
 
 ROAD_BUFFER_M = 3.0
 SIDEWALK_BUFFER_M = 1.5
@@ -365,6 +357,8 @@ def _combine_ground_surfaces(
 
 def _normalize_ground_mesh(mesh: pv.PolyData) -> pv.PolyData:
     tri = mesh.triangulate()
+    if not isinstance(tri, pv.PolyData):
+        tri = tri.extract_surface()
     kinds = tri.cell_data.get("surface_kind")
     if kinds is None or np.asarray(kinds).reshape(-1).shape[0] != tri.n_cells:
         tri.cell_data["surface_kind"] = np.zeros((tri.n_cells,), dtype=np.uint8)
@@ -388,7 +382,7 @@ def _load_or_fetch_osm_cached(
 ) -> tuple[pv.PolyData, object, pv.PolyData, pv.PolyData, list]:
     key = _cache_key(
         "osm",
-        "v9_pbr_class",
+        "v10_parking_bclass",
         data_source,
         address,
         radius,
@@ -421,33 +415,57 @@ def _load_or_fetch_osm_cached(
             )
             if use_cache:
                 cache_dir.mkdir(parents=True, exist_ok=True)
+                if not isinstance(road_mesh, pv.PolyData):
+                    road_mesh = road_mesh.extract_surface()
+                if not isinstance(sidewalk_mesh, pv.PolyData):
+                    sidewalk_mesh = sidewalk_mesh.extract_surface()
                 road_mesh.save(road_path)
                 sidewalk_mesh.save(sidewalk_path)
 
         # Places are not cached to disk — re-fetch each run (fast network call)
         from overture_source import _geocode_address, _radius_to_bbox, _make_local_transformer, fetch_and_project_places
         _lat, _lon = _geocode_address(address)
+        street_graph.graph["scene_lat"] = float(_lat)
+        street_graph.graph["scene_lon"] = float(_lon)
         _bbox = _radius_to_bbox(_lat, _lon, radius)
         _to_local, _ = _make_local_transformer(_lat, _lon)
         places = fetch_and_project_places(_bbox, _to_local, min_confidence=0.75, clip_radius_m=radius)
         print(f"Loaded OSM cache: {mesh_path.name}")
         return buildings_mesh, street_graph, road_mesh, sidewalk_mesh, places
 
-    buildings_mesh, street_graph, places = build_3d_buildings_and_street_graph(
+    if data_source == "osm":
+        import osm_3d_buildings as src_module
+        print("[source] Using OpenStreetMap via OSMnx")
+    else:
+        import overture_source as src_module
+        print("[source] Using Overture Maps")
+
+    buildings_mesh, street_graph, places, park_mesh = src_module.build_3d_buildings_and_street_graph(
         address=address,
         radius=radius,
         extrusion_height=extrusion_height,
+        cache_dir=cache_dir,
+        use_cache=use_cache,
+        cache_context_key=key,
     )
-    road_mesh, sidewalk_mesh = build_road_and_sidewalk_meshes_from_graph(
+    road_mesh, sidewalk_mesh = src_module.build_road_and_sidewalk_meshes_from_graph(
         projected_graph=street_graph,
         road_buffer_m=ROAD_BUFFER_M,
         sidewalk_buffer_m=SIDEWALK_BUFFER_M,
         road_extrude_z=ROAD_EXTRUDE_Z,
         sidewalk_extrude_z=SIDEWALK_EXTRUDE_Z,
     )
+    if park_mesh is not None:
+        sidewalk_mesh = sidewalk_mesh.merge(park_mesh)
 
     if use_cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
+        if not isinstance(buildings_mesh, pv.PolyData):
+            buildings_mesh = buildings_mesh.extract_surface()
+        if not isinstance(road_mesh, pv.PolyData):
+            road_mesh = road_mesh.extract_surface()
+        if not isinstance(sidewalk_mesh, pv.PolyData):
+            sidewalk_mesh = sidewalk_mesh.extract_surface()
         buildings_mesh.save(mesh_path)
         road_mesh.save(road_path)
         sidewalk_mesh.save(sidewalk_path)
@@ -540,6 +558,8 @@ def _load_or_build_spatial_cache(
 
     if use_cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
+        if not isinstance(ground_mesh, pv.PolyData):
+            ground_mesh = ground_mesh.extract_surface()
         ground_mesh.save(ground_path)
         with open(octree_path, "wb") as f:
             pickle.dump(octree_root, f)
@@ -596,29 +616,8 @@ def _load_hdri(hour: float, preset: str) -> pv.Texture:
         except Exception as _exc:
             print(f"[hdri] failed to load local HDRI {local_path.name}: {_exc}")
 
-    # Fallback: use example skybox for daytime.
-    base_tex = pv.examples.download_sky_box_cube_map()
-    if not is_night:
-        return base_tex
-
-    # Night fallback: darken the fallback cubemap with scalar multiply.
-    try:
-        img = base_tex.to_image()
-        arr_name = img.point_data.active_scalars_name
-        if arr_name is None:
-            names = list(img.point_data.keys())
-            if not names:
-                return base_tex
-            arr_name = names[0]
-        rgba = np.asarray(img.point_data[arr_name])
-        if rgba.size == 0:
-            return base_tex
-        dark = np.clip(rgba.astype(np.float32) * 0.25, 0.0, 255.0).astype(np.uint8)
-        dark_img = img.copy(deep=True)
-        dark_img.point_data[arr_name] = dark
-        return pv.Texture(dark_img)
-    except Exception:
-        return base_tex
+    # Fallback: disabled online download to prevent network hangs on main Cocoa thread.
+    raise FileNotFoundError("Dynamic HDRI assets not found, offline fallback to gradient backgrounds.")
 
 
 def _build_spotlight_discs(positions_xy: np.ndarray, radius: float, z: float = 0.08) -> pv.PolyData | None:

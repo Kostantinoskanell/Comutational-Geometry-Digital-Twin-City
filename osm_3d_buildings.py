@@ -14,6 +14,9 @@ from shapely.geometry import LineString, MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import linemerge, triangulate, unary_union
 
+from overture_source import _radius_to_bbox
+from turn_restrictions import load_osm_direction_graph_cached, resolve_osm_road_direction
+
 LEVEL_HEIGHT_M = 3.0
 PARAPET_INSET_M = 0.35
 PARAPET_HEIGHT_M = 1.0
@@ -23,6 +26,7 @@ MAX_SEGMENT_BUFFER_AREA_M2 = 3000.0
 SEGMENT_AREA_EXPANSION_FACTOR = 8.0
 CAR_SURFACE_RGB = np.array([0x33, 0x33, 0x33], dtype=np.uint8)
 PED_SURFACE_RGB = np.array([0xA0, 0xA0, 0xA0], dtype=np.uint8)
+PARK_SURFACE_RGB = np.array([0x27, 0xae, 0x60], dtype=np.uint8)  # Green
 
 
 def _iter_polygon_parts(geometry: BaseGeometry) -> Iterator[Polygon]:
@@ -431,7 +435,7 @@ def build_3d_city_with_street_surfaces(
     sidewalk_extrude_z: float = 0.15,
 ) -> tuple[pv.PolyData, pv.PolyData, pv.PolyData, nx.MultiDiGraph]:
     """Fetch OSM data and return building, road, sidewalk meshes + projected graph."""
-    buildings_mesh, projected_graph = build_3d_buildings_and_street_graph(
+    buildings_mesh, projected_graph, _places, _park_mesh = build_3d_buildings_and_street_graph(
         address=address,
         radius=radius,
         extrusion_height=extrusion_height,
@@ -443,14 +447,17 @@ def build_3d_city_with_street_surfaces(
         road_extrude_z=road_extrude_z,
         sidewalk_extrude_z=sidewalk_extrude_z,
     )
-    return buildings_mesh, road_mesh, sidewalk_mesh, projected_graph
+    return buildings_mesh, road_mesh, sidewalk_mesh, projected_graph, _park_mesh
 
 
 def build_3d_buildings_and_street_graph(
     address: str,
     radius: float,
     extrusion_height: float = 10.0,
-) -> Tuple[pv.PolyData, nx.MultiDiGraph]:
+    cache_dir=None,
+    use_cache: bool = False,
+    cache_context_key: str = "",
+) -> Tuple[pv.PolyData, nx.MultiDiGraph, list]:
     """Fetch OSM buildings and streets around an address and build 3D buildings.
 
     Parameters
@@ -468,28 +475,113 @@ def build_3d_buildings_and_street_graph(
         Combined 3D building mesh and projected directed street graph.
     """
     center = ox.geocode(address)
+    proj_str = f"+proj=tmerc +lat_0={center[0]} +lon_0={center[1]} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
 
     building_tags = {"building": True}
-    buildings: gpd.GeoDataFrame = ox.features_from_point(
-        center,
-        tags=building_tags,
-        dist=radius,
-    )
+    try:
+        buildings: gpd.GeoDataFrame = ox.features_from_point(
+            center,
+            tags=building_tags,
+            dist=radius,
+        )
+    except Exception:
+        buildings = gpd.GeoDataFrame()
 
-    street_graph = ox.graph_from_point(
-        center,
-        dist=radius,
-        network_type="all",
-        simplify=True,
-    )
+    try:
+        street_graph = ox.graph_from_point(
+            center,
+            dist=radius,
+            network_type="all",
+            simplify=True,
+        )
+    except Exception:
+        street_graph = nx.MultiDiGraph()
 
-    projected_buildings = ox.projection.project_gdf(buildings)
-    projected_graph = ox.projection.project_graph(street_graph)
+    if not buildings.empty:
+        projected_buildings = buildings.to_crs(proj_str)
+    else:
+        projected_buildings = gpd.GeoDataFrame()
+        
+    if len(street_graph) > 0:
+        projected_graph = ox.projection.project_graph(street_graph, to_crs=proj_str)
+    else:
+        projected_graph = nx.MultiDiGraph()
+        projected_graph.graph["crs"] = proj_str
+
     projected_graph.graph["scene_lat"] = float(center[0])
     projected_graph.graph["scene_lon"] = float(center[1])
 
+    # Fetch Parks and Parking
+    park_tags = {"leisure": "park", "landuse": ["grass", "meadow", "recreation_ground", "village_green"]}
+    try:
+        parks: gpd.GeoDataFrame = ox.features_from_point(center, tags=park_tags, dist=radius)
+        if not parks.empty:
+            projected_parks = parks.to_crs(proj_str)
+        else:
+            projected_parks = gpd.GeoDataFrame()
+    except Exception:
+        projected_parks = gpd.GeoDataFrame()
+
+    parking_tags = {"amenity": "parking"}
+    try:
+        parking: gpd.GeoDataFrame = ox.features_from_point(center, tags=parking_tags, dist=radius)
+        if not parking.empty:
+            projected_parking = parking.to_crs(proj_str)
+        else:
+            projected_parking = gpd.GeoDataFrame()
+    except Exception:
+        projected_parking = gpd.GeoDataFrame()
+
+    bbox = _radius_to_bbox(float(center[0]), float(center[1]), float(radius))
+    osm_direction_graph = load_osm_direction_graph_cached(
+        bbox_wsen=bbox,
+        target_crs=projected_graph.graph.get("crs"),
+        cache_dir=cache_dir,
+        use_cache=use_cache,
+        cache_context_key=cache_context_key,
+    )
+    projected_graph.graph["source_bbox_wsen"] = bbox
+    
+    from shapely.geometry import Point as _Pt
+    from shapely.geometry import MultiLineString as _MLS
+    clip_circle = _Pt(0.0, 0.0).buffer(float(radius))
+
+    for u, v, data in projected_graph.edges(data=True):
+        geom = data.get("geometry")
+        if geom is None:
+            nu = projected_graph.nodes[u]
+            nv = projected_graph.nodes[v]
+            if "x" in nu and "y" in nu and "x" in nv and "y" in nv:
+                geom = LineString([(float(nu["x"]), float(nu["y"])), (float(nv["x"]), float(nv["y"]))])
+        
+        if geom is not None:
+            clipped = geom.intersection(clip_circle)
+            if clipped.is_empty:
+                continue
+            if isinstance(clipped, _MLS):
+                parts = list(clipped.geoms)
+                clipped = max(parts, key=lambda g: g.length)
+            if isinstance(clipped, LineString) and not clipped.is_empty:
+                data["geometry"] = clipped
+                geom = clipped
+                
+        if geom is not None and hasattr(geom, "coords"):
+            coords = np.asarray(geom.coords, dtype=float)
+            if coords.shape[0] >= 2:
+                oneway, legal_forward = resolve_osm_road_direction(
+                    (float(coords[0][0]), float(coords[0][1])),
+                    (float(coords[-1][0]), float(coords[-1][1])),
+                    osm_direction_graph,
+                )
+                data["oneway"] = bool(data.get("oneway", False)) if oneway is None else bool(oneway)
+                data["oneway_legal_forward"] = bool(legal_forward) if legal_forward is not None else True
+
+
     extruded_meshes: list[pv.PolyData] = []
     _n_buildings = 0
+    res_points = []
+    com_points = []
+    
     for _, row in projected_buildings.iterrows():
         geometry = row.geometry
         if geometry is None:
@@ -518,6 +610,16 @@ def build_3d_buildings_and_street_graph(
                 parapet_mesh = _make_parapet_mesh(poly, base_height=float(building_height))
                 if parapet_mesh is not None and parapet_mesh.n_points > 0:
                     refined = refined.merge(parapet_mesh)
+            bclass = 0 # concrete
+            b_tag = str(row.get("building", "")).lower()
+            if b_tag in {"apartments", "house", "residential", "detached", "terrace"}:
+                bclass = 4 # residential
+                res_points.append((poly.centroid.x, poly.centroid.y))
+            elif b_tag in {"commercial", "retail", "office", "supermarket", "shop"}:
+                bclass = 3 # commercial
+                com_points.append((poly.centroid.x, poly.centroid.y))
+                
+            refined.cell_data["building_class"] = np.full(refined.n_cells, bclass, dtype=np.uint8)
 
             extruded_meshes.append(refined)
             _n_buildings += 1
@@ -525,9 +627,62 @@ def build_3d_buildings_and_street_graph(
                 print(f"[build] extruded {_n_buildings} buildings...")
 
     if not extruded_meshes:
-        return pv.PolyData(), projected_graph
+        combined_mesh = pv.PolyData()
+    else:
+        print(f"[build] merging {len(extruded_meshes)} building meshes...")
+        combined_mesh = pv.MultiBlock(extruded_meshes).combine(merge_points=False)
+        
+    park_meshes = []
+    if not projected_parks.empty:
+        for _, row in projected_parks.iterrows():
+            geometry = row.geometry
+            if geometry is None: continue
+            for poly in _iter_polygon_parts(geometry):
+                footprint = _polygon_to_footprint(poly)
+                if footprint is None or footprint.n_points < 3: continue
+                park_extruded = footprint.extrude((0.0, 0.0, 0.02), capping=True)
+                if park_extruded.n_points > 0:
+                    park_meshes.append(park_extruded)
+    
+    if park_meshes:
+        park_combined = pv.MultiBlock(park_meshes).combine(merge_points=False)
+        park_combined = _apply_surface_color(park_combined, PARK_SURFACE_RGB)
+    else:
+        park_combined = None
 
-    print(f"[build] merging {len(extruded_meshes)} building meshes...")
-    combined_mesh = pv.MultiBlock(extruded_meshes).combine(merge_points=False)
+    parking_meshes = []
+    if not projected_parking.empty:
+        for _, row in projected_parking.iterrows():
+            geometry = row.geometry
+            if geometry is None: continue
+            for poly in _iter_polygon_parts(geometry):
+                footprint = _polygon_to_footprint(poly)
+                if footprint is None or footprint.n_points < 3: continue
+                com_points.append((poly.centroid.x, poly.centroid.y))
+                parking_extruded = footprint.extrude((0.0, 0.0, 0.015), capping=True)
+                if parking_extruded.n_points > 0:
+                    parking_meshes.append(parking_extruded)
+                    
+    if parking_meshes:
+        parking_combined = pv.MultiBlock(parking_meshes).combine(merge_points=False)
+        # Dark grey for parking
+        parking_combined = _apply_surface_color(parking_combined, np.array([0x1f, 0x1f, 0x1f], dtype=np.uint8))
+        if park_combined is not None:
+            park_combined = park_combined.merge(parking_combined)
+        else:
+            park_combined = parking_combined
 
-    return combined_mesh, projected_graph
+    # Annotate nearest nodes
+    if len(projected_graph) > 0:
+        if res_points:
+            rx, ry = zip(*res_points)
+            r_nodes = ox.nearest_nodes(projected_graph, rx, ry)
+            for n in r_nodes:
+                projected_graph.nodes[n]["is_residential"] = True
+        if com_points:
+            cx, cy = zip(*com_points)
+            c_nodes = ox.nearest_nodes(projected_graph, cx, cy)
+            for n in c_nodes:
+                projected_graph.nodes[n]["is_commercial"] = True
+
+    return combined_mesh, projected_graph, [], park_combined

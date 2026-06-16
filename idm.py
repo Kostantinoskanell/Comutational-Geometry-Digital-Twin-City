@@ -18,7 +18,7 @@ idm_accelerations(speed, desired, gap, dv, params) -> accel
     O(N): fully vectorised NumPy IDM formula — no Python loop.
 
 idm_tick(car_anim, car_paths, car_next_edges, traffic_lights,
-         dt, params, rng, traffic_speed) -> None
+         dt, params, rng, traffic_speed, roundabout_yield_map=None) -> None
     Top-level per-tick function.  Mutates car_anim in-place.
     Implements symplectic Euler integration order:
         snapshot → edge_car_map → (gap, dv, at_stopline) → accel → v_new → positions → write-back
@@ -144,7 +144,14 @@ def find_leaders(
     car_paths:        list[dict],        # path dicts — need "v" for TL lookup
     traffic_lights:   dict,              # node_id → TrafficLight-like object
     params:           IDMParams,
-) -> tuple[np.ndarray, np.ndarray]:
+    desired:          np.ndarray | None = None, # (N,) float64 desired speeds
+    adj_left:         np.ndarray | None = None, # (P,) int64
+    adj_right:        np.ndarray | None = None, # (P,) int64
+    rng:              np.random.Generator | None = None,
+    roundabout_yield_map: dict[int, np.ndarray] | None = None,
+    stop_wait:        np.ndarray | None = None, # (N,) float64
+    dt:               float = 0.1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute gap[] and dv[] for every car using a three-priority hierarchy.
 
     Priority (lowest gap wins):
@@ -181,12 +188,71 @@ def find_leaders(
         ecm_dists[edge] = [float(d) for d, _ in bucket]
         ecm_ids[edge] = [int(j) for _, j in bucket]
 
+    n_paths = int(car_path_lengths.shape[0])
+    n_next = len(car_next_edges)
     for i in range(n):
         e      = int(edge_idx[i])
+        if e < 0 or e >= n_paths:
+            continue
         d_i    = float(dist[i])
         v_i    = float(speed[i])
         len_i  = float(car_len[i])
         e_len  = float(car_path_lengths[e])
+
+        # ── Heuristic Lane Changing ──────────────────────────────────────────
+        if desired is not None and adj_left is not None and adj_right is not None and rng is not None:
+            v0_i = float(desired[i])
+            if v_i < v0_i * 0.8:
+                bucket_dists = ecm_dists.get(e)
+                bucket_ids = ecm_ids.get(e)
+                curr_gap = _FREE_FLOW
+                if bucket_dists and bucket_ids:
+                    pos = bisect.bisect_right(bucket_dists, d_i + 0.01)
+                    if pos < len(bucket_dists):
+                        curr_gap = max(0.1, float(bucket_dists[pos]) - d_i - len_i)
+                
+                if curr_gap < 15.0:
+                    cand_l = int(adj_left[e])
+                    cand_r = int(adj_right[e])
+                    cands = []
+                    if cand_l >= 0: cands.append(cand_l)
+                    if cand_r >= 0: cands.append(cand_r)
+                    if cands:
+                        rng.shuffle(cands)
+                        for cand_e in cands:
+                            c_dists = ecm_dists.get(cand_e)
+                            c_ids = ecm_ids.get(cand_e)
+                            safe = True
+                            cand_gap = _FREE_FLOW
+                            if c_dists and c_ids:
+                                pos = bisect.bisect_right(c_dists, d_i + 0.01)
+                                if pos < len(c_dists):
+                                    leader_gap = max(0.1, float(c_dists[pos]) - d_i - len_i)
+                                    cand_gap = leader_gap
+                                    if leader_gap < 15.0: safe = False
+                                if safe and pos > 0:
+                                    f_d = float(c_dists[pos - 1])
+                                    f_idx = c_ids[pos - 1]
+                                    if d_i - f_d - float(car_len[f_idx]) < 5.0: safe = False
+                            if safe and cand_gap > curr_gap:
+                                # Switch lane!
+                                edge_idx[i] = cand_e
+                                e = cand_e
+                                e_len = float(car_path_lengths[e])
+                                if bucket_dists and bucket_ids:
+                                    old_pos = bisect.bisect_right(bucket_dists, d_i) - 1
+                                    if old_pos >= 0 and bucket_ids[old_pos] == i:
+                                        bucket_dists.pop(old_pos)
+                                        bucket_ids.pop(old_pos)
+                                if c_dists is None:
+                                    c_dists = []
+                                    ecm_dists[cand_e] = c_dists
+                                    c_ids = []
+                                    ecm_ids[cand_e] = c_ids
+                                new_pos = bisect.bisect_right(c_dists, d_i)
+                                c_dists.insert(new_pos, d_i)
+                                c_ids.insert(new_pos, i)
+                                break
 
         best_gap: float = _FREE_FLOW
         best_dv:  float = 0.0
@@ -208,7 +274,7 @@ def find_leaders(
         # ── Priority 2: cross-edge leader ────────────────────────────────────
         # If no same-edge leader, look at the frontmost car on each next edge.
         # Choose the candidate that gives the smallest gap.
-        if best_gap == _FREE_FLOW:
+        if best_gap == _FREE_FLOW and e < n_next:
             dist_to_end = e_len - d_i
             for ne_raw in car_next_edges[e]:
                 ne = int(ne_raw)
@@ -229,12 +295,65 @@ def find_leaders(
         # Overrides a real leader only when the ghost is closer.
         node_id = car_paths[e]["v"]
         tl = traffic_lights.get(node_id)
-        if tl is not None and not tl.can_enter(e):
+        if tl is not None and e in tl.controlled_paths and not tl.can_enter(e):
             stopline_dist = e_len - d_i
             if stopline_dist <= 1e-3:
                 # Avoid ghost-gap singularity when already clamped at stop line.
                 at_stopline_arr[i] = True
                 best_gap = _FREE_FLOW
+                best_dv = 0.0
+                
+        # ── Priority 3b: Stop signs ──────────────────────────────────────────
+        # If the intersection is controlled by a stop sign, the car must
+        # halt, wait 2 seconds, and then it can proceed.
+        if car_paths[e].get("control") == "stop" and stop_wait is not None:
+            stopline_dist = e_len - d_i
+            # If within 15 meters of the stop line, start evaluating stop logic
+            if stopline_dist < 15.0:
+                # Are we physically stopped at the line?
+                if stopline_dist < params.s0 + 1.0 and v_i < 0.1:
+                    stop_wait[i] += dt
+                
+                if stop_wait[i] < 2.0:
+                    # Still need to wait, inject ghost leader at stopline
+                    ghost_gap = max(0.1, stopline_dist - params.s0)
+                    if ghost_gap < best_gap:
+                        best_gap = ghost_gap
+                        best_dv = v_i
+                        at_stopline_arr[i] = (stopline_dist <= 1e-3)
+                else:
+                    # Wait time fulfilled! Allow it to proceed (unless there is cross traffic).
+                    # (For a complete yield, we'd check conflicts. For now, 2s wait suffices).
+                    pass
+                
+        # ── Priority 4: Roundabout Yield Logic ───────────────────────────────
+        # If this car is about to enter a roundabout, check for cars already on the ring
+        # that are approaching the same entry node.
+        if best_gap == _FREE_FLOW and roundabout_yield_map is not None:
+            if e in roundabout_yield_map:
+                ring_edges = roundabout_yield_map[e]
+                # Look at cars on the ring edges
+                for re in ring_edges:
+                    r_dists = ecm_dists.get(re)
+                    r_ids = ecm_ids.get(re)
+                    if not r_dists or not r_ids:
+                        continue
+                    # A car is approaching the node if it's on this ring edge.
+                    # We check the closest one to the entry node (which is the leader of the ring edge).
+                    # Actually, the frontmost car is r_dists[-1]
+                    d_r = float(r_dists[-1])
+                    j = int(r_ids[-1])
+                    r_len = float(car_path_lengths[re])
+                    dist_to_conflict = r_len - d_r
+                    
+                    # If a car is within 15 meters of the conflict point, yield to it.
+                    if dist_to_conflict < 15.0:
+                        # Inject a ghost leader at the entry node.
+                        stopline_dist = e_len - d_i
+                        g = max(0.1, stopline_dist - 0.5)
+                        if g < best_gap:
+                            best_gap = g
+                            best_dv = v_i  # Brake to stop
                 best_dv = 0.0
             else:
                 ghost_gap = max(0.1, stopline_dist - params.s0)
@@ -311,17 +430,20 @@ def _advance_positions(
     car_path_lengths: np.ndarray,        # (P,) float
     car_next_edges:   list[np.ndarray],
     car_paths:        list[dict],
+    traffic_lights:   dict,
+    params:           IDMParams,
     rng:              np.random.Generator,
     dt:               float,
     traffic_speed:    float,
+    planned_edges:    object = None,
+    planned_cursor:   np.ndarray | None = None,
 ) -> None:
     """Advance every car's position by v·dt, handling edge crossings.
 
         When a car crosses an edge boundary:
             - A successor edge is chosen at random from car_next_edges[current].
-                If the current edge is a dead-end, choose among paths that start at
-                the current edge's end-node (u == current.v). If none exist, keep the
-                car on its current edge and loop in place.
+                If the current edge has no legal successor, the car stops at the
+                end instead of inventing a local continuation.
             - desired_speed_base[i] is resampled from new edge maxspeed_ms × U(0.7, 1.0).
             - desired_speed[i] = desired_speed_base[i] × traffic_speed.
       - speed[i] is clamped to the new desired_speed so cars never exceed the
@@ -331,6 +453,8 @@ def _advance_positions(
     stops degenerate infinite loops on very short edges.
     """
     n = int(edge_idx.shape[0])
+    n_paths = int(car_path_lengths.shape[0])
+    n_next = len(car_next_edges)
 
     for i in range(n):
         remaining = float(speed[i]) * float(dt)
@@ -339,9 +463,21 @@ def _advance_positions(
 
         hops = 0
         while remaining > 1e-9 and hops < 8:
-            cidx   = int(edge_idx[i])
+            cidx = int(edge_idx[i])
+            if cidx < 0 or cidx >= n_paths:
+                break
             c_len  = float(car_path_lengths[cidx])
             to_end = max(0.0, c_len - float(dist[i]))
+            node_id = car_paths[cidx].get("v")
+            tl = traffic_lights.get(node_id)
+            if tl is not None and cidx in tl.controlled_paths and not tl.can_enter(cidx):
+                stop_dist = max(0.0, c_len - float(params.s0))
+                current_dist = float(dist[i])
+                if current_dist >= stop_dist or remaining >= max(0.0, stop_dist - current_dist):
+                    dist[i] = current_dist if current_dist >= stop_dist else stop_dist
+                    speed[i] = 0.0
+                    remaining = 0.0
+                    break
 
             if remaining < to_end:
                 dist[i] += remaining
@@ -351,22 +487,40 @@ def _advance_positions(
             # ── Cross the edge boundary ───────────────────────────────────
             remaining -= to_end
 
-            nexts = car_next_edges[cidx]
-            if nexts.size > 0:
+            nexts = car_next_edges[cidx] if cidx < n_next else np.empty(0, dtype=np.int64)
+            forced_next: int | None = None
+            if planned_edges is not None and planned_cursor is not None and i < planned_cursor.shape[0]:
+                try:
+                    plan = planned_edges[i]
+                    if plan is not None:
+                        plan_arr = np.asarray(plan, dtype=np.int64)
+                        if plan_arr.size > 0:
+                            cur = int(np.clip(int(planned_cursor[i]), 0, plan_arr.size - 1))
+                            if int(plan_arr[cur]) != cidx:
+                                matches = np.flatnonzero(plan_arr == cidx)
+                                if matches.size > 0:
+                                    cur = int(matches[0])
+                            if cur + 1 < plan_arr.size:
+                                candidate = int(plan_arr[cur + 1])
+                                if nexts.size == 0 or bool(np.any(nexts == candidate)):
+                                    forced_next = candidate
+                                    planned_cursor[i] = cur + 1
+                            else:
+                                planned_edges[i] = None
+                except Exception:
+                    forced_next = None
+
+            if forced_next is not None:
+                edge_idx[i] = int(forced_next)
+            elif nexts.size > 0:
                 edge_idx[i] = int(rng.choice(nexts))
             else:
-                current_v = car_paths[cidx].get("v")
-                continuation = [
-                    j for j, p in enumerate(car_paths)
-                    if p.get("u") == current_v
-                ]
-                if continuation:
-                    edge_idx[i] = int(rng.choice(np.asarray(continuation, dtype=np.int64)))
-                else:
-                    # No reachable continuation from this node: keep car on current edge.
-                    dist[i] = 0.0
-                    remaining = 0.0
-                    break
+                # No legal OSM successor from this node: stop at the end instead
+                # of inventing a local graph continuation.
+                dist[i] = max(0.0, c_len - 1e-6)
+                speed[i] = 0.0
+                remaining = 0.0
+                break
 
             dist[i] = 0.0
 
@@ -400,38 +554,17 @@ def idm_tick(
     dt:             float,
     params:         IDMParams,
     rng:            np.random.Generator,
-    traffic_speed:  float = 1.0,
+    traffic_speed: float = 1.0,
+    roundabout_yield_map: dict[int, np.ndarray] | None = None,
 ) -> None:
-    """Full IDM simulation tick.  Mutates car_anim in-place.
-
-    Data flow
-    ---------
-        tick snapshot
-            ↓
-        build edge_car_map  (O(N log N))
-            ↓
-        find_leaders → gap[], dv[]     ← ghost leaders injected here
-            ↓
-        idm_accelerations → accel[]   (vectorised O(N))
-            ↓
-        velocity update: v ← clip(v + a·dt, 0, v₀)   (symplectic Euler)
-            ↓
-        _advance_positions  (edge crossings)
-            ↓
-        write-back → car_anim
-
-    Symplectic Euler guarantee
-    --------------------------
-    All accelerations are computed from the tick-start snapshot before any
-    velocities change, and all velocities are updated before any positions
-    change.  This prevents cars from reading each other's mid-tick state.
-
+    """Full IDM simulation tick. Mutates car_anim in-place.
+    
     Parameters
     ----------
-    car_anim       : shared animation state dict (see module docstring).
-    car_paths      : list of path dicts; keys "u","v","length","maxspeed_ms".
+    car_anim       : shared animation state dict
+    car_paths      : list of path dicts
     car_next_edges : car_next_edges[p] = ndarray of successor path indices.
-    traffic_lights : node_id → TrafficLight FSM (must have .can_enter(int)).
+    traffic_lights : node_id → TrafficLight FSM
     dt             : simulation timestep in seconds.
     params         : IDMParams instance.
     rng            : numpy Generator used for stochastic edge-hop choices.
@@ -457,15 +590,26 @@ def idm_tick(
     car_path_lengths = np.asarray(
         [float(p["length"]) for p in car_paths], dtype=float
     )
+    n_paths = int(car_path_lengths.shape[0])
+    if n_paths > 0:
+        edge_idx = np.clip(edge_idx, 0, n_paths - 1)
+        dist = np.clip(dist, 0.0, np.maximum(car_path_lengths[edge_idx] - 1e-6, 0.0))
 
     # ── Step 2: Build edge → sorted-car map ──────────────────────────────────
     # (Implicitly done inside find_leaders; exposed separately for reuse.)
 
     # ── Step 3: Leader lookup + ghost-leader injection ───────────────────────
+    stop_wait = np.array(car_anim["stop_wait"], dtype=float)
+    
     gap, dv, at_stopline = find_leaders(
         edge_idx, dist, speed, car_len,
         car_path_lengths, car_next_edges, car_paths,
         traffic_lights, params,
+        desired=desired,
+        rng=rng,
+        roundabout_yield_map=roundabout_yield_map,
+        stop_wait=stop_wait,
+        dt=dt,
     )
 
     # ── Step 4: Vectorised IDM accelerations — no Python loop ────────────────
@@ -482,7 +626,10 @@ def idm_tick(
     _advance_positions(
         edge_idx, dist, speed, desired, desired_base,
         car_path_lengths, car_next_edges, car_paths,
+        traffic_lights, params,
         rng, dt, float(traffic_speed),
+        car_anim.get("planned_edges"),
+        car_anim.get("planned_cursor"),
     )
 
     # ── Step 7: Write back all mutated state ──────────────────────────────────
@@ -492,3 +639,4 @@ def idm_tick(
     car_anim["desired_speed"] = desired
     car_anim["desired_speed_base"] = desired_base
     car_anim["accel"]         = accel
+    car_anim["stop_wait"]     = stop_wait

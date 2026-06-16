@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from pathlib import Path
 from typing import Optional
 
 import networkx as nx
@@ -36,8 +37,10 @@ from shapely.geometry import (
 )
 from shapely.ops import unary_union
 
+from turn_restrictions import load_osm_direction_graph_cached, resolve_osm_road_direction
+
 try:
-    import overturemaps
+    import overturemaps  # type: ignore
     _OVERTURE_AVAILABLE = True
 except ImportError:
     _OVERTURE_AVAILABLE = False
@@ -416,30 +419,37 @@ def _fetch_overture_segments(
             class_ = d.get("class", [None] * n)[i]
             road = _seg_road_col(d, i, n)
 
-            # Try multiple Overture schema locations for oneway flag
             is_oneway = False
             try:
                 if isinstance(road, dict):
-                    # Schema v1: road.restrictions.use_as_through_traffic
-                    restrictions = road.get("restrictions", {})
-                    if isinstance(restrictions, dict):
-                        if restrictions.get("use_as_through_traffic") == "no":
-                            is_oneway = True
-                    # Schema v2: road.flags list (older releases)
+                    # Signal 1: explicit oneway flag (some Overture schema versions)
+                    if road.get("is_oneway") is True:
+                        is_oneway = True
+
+                    # Signal 2: road.flags list — look for explicit one_way flag only
                     flags = road.get("flags", [])
                     if isinstance(flags, list):
-                        if any("one_way" in str(f).lower() or "oneway" in str(f).lower() for f in flags):
+                        if any(
+                            str(f).lower() in {"one_way", "oneway", "is_oneway"}
+                            for f in flags
+                        ):
                             is_oneway = True
-                    # Schema v3: road.lanes list — if all lanes have same direction
+
+                    # Signal 3: road.lanes[].direction — only trust when ALL lanes
+                    # are present and ALL share the same non-empty direction value.
+                    # "use_as_through_traffic" is intentionally NOT checked here;
+                    # it means rat-run restriction, not one-way direction.
                     lanes = road.get("lanes", [])
                     if isinstance(lanes, list) and len(lanes) > 0:
                         directions = set()
                         for lane in lanes:
                             if isinstance(lane, dict):
-                                d_val = lane.get("direction", "")
+                                d_val = str(lane.get("direction") or "").strip().lower()
                                 if d_val:
-                                    directions.add(str(d_val).lower())
-                        if directions == {"forward"} or directions == {"backward"}:
+                                    directions.add(d_val)
+                        # Only treat as one-way when every lane has an explicit
+                        # direction and they all agree on forward OR backward.
+                        if len(directions) == 1 and directions <= {"forward", "backward"}:
                             is_oneway = True
             except Exception:
                 pass
@@ -659,6 +669,7 @@ def _build_street_graph(
     segments: list[dict],
     transformer: Transformer,
     clip_radius_m: float | None = None,
+    osm_direction_graph: nx.MultiDiGraph | None = None,
 ) -> nx.MultiDiGraph:
     """
     Build a NetworkX MultiDiGraph from Overture segment features.
@@ -727,6 +738,20 @@ def _build_street_graph(
         if len(coords) < 2:
             continue
 
+        osm_oneway, osm_legal_forward = resolve_osm_road_direction(
+            (float(coords[0][0]), float(coords[0][1])),
+            (float(coords[-1][0]), float(coords[-1][1])),
+            osm_direction_graph,
+        )
+        if osm_oneway is None:
+            osm_oneway = bool(seg.get("is_oneway", False))
+        if osm_legal_forward is None:
+            osm_legal_forward = True
+
+        if osm_oneway and not osm_legal_forward:
+            local_line = LineString(coords[::-1])
+            coords = list(local_line.coords)
+
         start_xy = coords[0]
         end_xy = coords[-1]
         u = _get_or_create_node(start_xy)
@@ -754,7 +779,8 @@ def _build_street_graph(
             "highway": seg["class_"],
             "geometry": local_line,
             "length": length,
-            "oneway": seg["is_oneway"],
+            "oneway": bool(osm_oneway),
+            "oneway_legal_forward": bool(osm_legal_forward),
             "maxspeed": maxspeed,
             "lanes": seg.get("lanes"),
             "surface": seg.get("road_surface"),
@@ -765,7 +791,7 @@ def _build_street_graph(
         }
 
         G.add_edge(u, v, **edge_data)
-        if not seg["is_oneway"]:
+        if not osm_oneway:
             G.add_edge(v, u, **{**edge_data, "geometry": LineString(coords[::-1])})
 
     # Store the segment→connector mapping as a graph-level attribute
@@ -1150,6 +1176,9 @@ def build_3d_buildings_and_street_graph(
     address: str,
     radius: float = 150.0,
     extrusion_height: float = 10.0,
+    cache_dir: Path | None = None,
+    use_cache: bool = False,
+    cache_context_key: str = "",
 ) -> tuple[pv.PolyData, nx.MultiDiGraph, list[dict]]:
     """
     Fetch Overture Maps data and build a 3D city model.
@@ -1188,6 +1217,7 @@ def build_3d_buildings_and_street_graph(
 
     # 3. Build local metric projection (origin = scene centre)
     to_local, _ = _make_local_transformer(lat, lon)
+    target_crs = getattr(to_local, "target_crs", None)
 
     # 4. Fetch and build buildings
     print("[Overture] Fetching buildings...")
@@ -1216,9 +1246,23 @@ def build_3d_buildings_and_street_graph(
     class_counts = Counter(s.get("class_", "unknown") for s in segments)
     print(f"[Overture] Segment classes: {dict(class_counts)}")
 
-    street_graph = _build_street_graph(segments, to_local, clip_radius_m=radius * 1.3)
+    osm_direction_graph = load_osm_direction_graph_cached(
+        bbox_wsen=bbox_roads,
+        target_crs=target_crs,
+        cache_dir=cache_dir,
+        use_cache=use_cache,
+        cache_context_key=cache_context_key,
+    )
+    street_graph = _build_street_graph(
+        segments,
+        to_local,
+        clip_radius_m=radius * 1.3,
+        osm_direction_graph=osm_direction_graph,
+    )
     street_graph.graph["scene_lat"] = float(lat)
     street_graph.graph["scene_lon"] = float(lon)
+    street_graph.graph["source_bbox_wsen"] = bbox_roads
+    street_graph.graph["crs"] = target_crs
     print(
         f"[Overture] Street graph: "
         f"{street_graph.number_of_nodes()} nodes, "
@@ -1240,4 +1284,120 @@ def build_3d_buildings_and_street_graph(
         clip_radius_m=radius,
     )
 
-    return buildings_mesh, street_graph, places
+    # 7.5 Add building centroids as residential POIs (for parked cars)
+    print(f"[Overture] Extracting building centroids...")
+    for b in buildings:
+        geom = b.get("geometry")
+        if geom is not None and not geom.is_empty:
+            c = geom.centroid
+            px, py = to_local.transform(c.y, c.x)
+            places.append({
+                "name": "Residential Building",
+                "categories": ["residential"],
+                "confidence": 1.0,
+                "x": px,
+                "y": py
+            })
+
+    # 8. Hybrid: Fetch parks and parking from OSM
+    try:
+        import osmnx as ox
+        import geopandas as gpd
+        import pyvista as pv
+        import numpy as np
+        from osm_3d_buildings import _iter_polygon_parts, _polygon_to_footprint, _apply_surface_color, PARK_SURFACE_RGB
+        
+        center = (lat, lon)
+        proj_str = target_crs if target_crs else f"+proj=tmerc +lat_0={lat} +lon_0={lon} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+        
+        park_tags = {"leisure": "park", "landuse": ["grass", "meadow", "recreation_ground", "village_green"]}
+        try:
+            parks: gpd.GeoDataFrame = ox.features_from_point(center, tags=park_tags, dist=radius)
+            projected_parks = parks.to_crs(proj_str) if not parks.empty else gpd.GeoDataFrame()
+        except Exception:
+            projected_parks = gpd.GeoDataFrame()
+
+        parking_tags = {"amenity": "parking"}
+        try:
+            parking: gpd.GeoDataFrame = ox.features_from_point(center, tags=parking_tags, dist=radius)
+            projected_parking = parking.to_crs(proj_str) if not parking.empty else gpd.GeoDataFrame()
+        except Exception:
+            projected_parking = gpd.GeoDataFrame()
+            
+        park_meshes = []
+        if not projected_parks.empty:
+            for _, row in projected_parks.iterrows():
+                geometry = row.geometry
+                if geometry is None: continue
+                for poly in _iter_polygon_parts(geometry):
+                    footprint = _polygon_to_footprint(poly)
+                    if footprint is None or footprint.n_points < 3: continue
+                    park_extruded = footprint.extrude((0.0, 0.0, 0.02), capping=True)
+                    if park_extruded.n_points > 0:
+                        park_meshes.append(park_extruded)
+        
+        if park_meshes:
+            park_combined = pv.MultiBlock(park_meshes).combine(merge_points=False)
+            park_combined = _apply_surface_color(park_combined, PARK_SURFACE_RGB)
+        else:
+            park_combined = None
+
+        parking_meshes = []
+        if not projected_parking.empty:
+            for _, row in projected_parking.iterrows():
+                geometry = row.geometry
+                if geometry is None: continue
+                for poly in _iter_polygon_parts(geometry):
+                    footprint = _polygon_to_footprint(poly)
+                    if footprint is None or footprint.n_points < 3: continue
+                    parking_extruded = footprint.extrude((0.0, 0.0, 0.015), capping=True)
+                    if parking_extruded.n_points > 0:
+                        parking_meshes.append(parking_extruded)
+                        
+        if parking_meshes:
+            parking_combined = pv.MultiBlock(parking_meshes).combine(merge_points=False)
+            parking_combined = _apply_surface_color(parking_combined, np.array([0x1f, 0x1f, 0x1f], dtype=np.uint8))
+            if park_combined is not None:
+                park_combined = park_combined.merge(parking_combined)
+            else:
+                park_combined = parking_combined
+                
+        # Fetch traffic signals and stop signs from OSM and map to nearest Overture graph node
+        ts_tags = {"highway": ["traffic_signals", "stop"]}
+        try:
+            ts: gpd.GeoDataFrame = ox.features_from_point(center, tags=ts_tags, dist=radius)
+            if not ts.empty:
+                ts_projected = ts.to_crs(proj_str)
+                # For each control, find nearest Overture node
+                if len(street_graph.nodes) > 0:
+                    import scipy.spatial
+                    nodes_data = list(street_graph.nodes(data=True))
+                    node_ids = [n[0] for n in nodes_data]
+                    node_coords = np.array([[n[1]["x"], n[1]["y"]] for n in nodes_data])
+                    tree = scipy.spatial.cKDTree(node_coords)
+                    
+                    for _, row in ts_projected.iterrows():
+                        geom = row.geometry
+                        if geom is None: continue
+                        cx, cy = geom.centroid.x, geom.centroid.y
+                        
+                        hw_type = row.get("highway", "traffic_signals")
+                        if isinstance(hw_type, list) or isinstance(hw_type, np.ndarray):
+                            hw_type = hw_type[0]
+                        hw_type = str(hw_type)
+                        if hw_type not in ("traffic_signals", "stop"):
+                            hw_type = "traffic_signals"
+                            
+                        dist, idx = tree.query([cx, cy])
+                        if dist < 25.0:  # Map to node if within 25m
+                            # Preserve existing traffic_signals if it already is one
+                            existing = street_graph.nodes[node_ids[idx]].get("highway")
+                            if existing != "traffic_signals":
+                                street_graph.nodes[node_ids[idx]]["highway"] = hw_type
+        except Exception:
+            pass
+
+    except Exception:
+        park_combined = None
+
+    return buildings_mesh, street_graph, places, park_combined

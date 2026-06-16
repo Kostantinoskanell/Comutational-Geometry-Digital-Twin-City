@@ -43,7 +43,8 @@ def parse_args() -> argparse.Namespace:
         help="Sun direction vector for shadow mode.",
     )
     parser.add_argument("--n-lights", type=int, default=12, help="Number of streetlights for GA mode.")
-    parser.add_argument("--n-cars", type=int, default=24, help="Number of animated cars in view mode.")
+    parser.add_argument("--n-cars", type=int, default=-1, help="Number of animated cars (-1 for auto-density).")
+    parser.add_argument("--solo", action="store_true", help="Run with a single solar car and display live energy telemetry.")
     parser.add_argument(
         "--car-detail",
         choices=["ultra", "low"],
@@ -61,7 +62,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print car loading/runtime debug logs to terminal.",
     )
+    parser.add_argument(
+        "--solar-fleet",
+        action="store_true",
+        help="Use only solarcar.obj for all traffic; enable solar routing UI.",
+    )
     parser.add_argument("--light-radius", type=float, default=40.0, help="Streetlight illumination radius.")
+    parser.add_argument(
+        "--light-strategy",
+        choices=["smart", "ga"],
+        default="smart",
+        help="Streetlight placement strategy: smart greedy spacing or genetic algorithm.",
+    )
     parser.add_argument("--w1", type=float, default=1.0, help="Weight for dark area term.")
     parser.add_argument("--w2", type=float, default=0.5, help="Weight for double-lit area term.")
     parser.add_argument("--grid-step", type=float, default=10.0, help="Grid spacing for candidate light positions.")
@@ -173,8 +185,8 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
 
     root = tk.Tk()
     root.title("City Digital Twin")
-    root.geometry("600x500")
-    root.minsize(540, 440)
+    root.geometry("600x580")
+    root.minsize(540, 520)
     root.configure(bg=BG)
 
     # ── Theme & Styles ────────────────────────────────────────────────────────
@@ -225,12 +237,14 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
 
     cars_var         = tk.StringVar(value=str(int(args.n_cars)))
     car_detail_var   = tk.StringVar(value=str(args.car_detail))
-    traffic_var      = tk.StringVar(value=str(float(args.traffic_speed)))
+    traffic_var      = tk.DoubleVar(value=float(args.traffic_speed))
     roads_var        = tk.BooleanVar(value=not bool(args.hide_roads))
     show_cars_var    = tk.BooleanVar(value=bool(getattr(args, "show_cars", True)))
+    solar_fleet_var  = tk.BooleanVar(value=bool(getattr(args, "solar_fleet", False)))
 
     lights_var       = tk.StringVar(value=str(int(args.n_lights)))
     light_radius_var = tk.StringVar(value=str(int(float(args.light_radius))))
+    light_strategy_var = tk.StringVar(value=str(getattr(args, "light_strategy", "smart")))
     cov_jobs_var     = tk.StringVar(value=str(int(args.coverage_jobs)))
     ga_jobs_var      = tk.StringVar(value=str(int(args.ga_jobs)))
 
@@ -296,11 +310,46 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
     ttk.Combobox(
         tab2, textvariable=car_detail_var, values=["ultra", "low"], state="readonly"
     ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=5)
-    _entry_row(tab2, "Traffic Speed (\u00d7)", traffic_var, "e.g. 1.0",  row=2)
+
+    solar_frame = ttk.LabelFrame(tab2, text="Solar car fleet", padding=(10, 8))
+    solar_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(6, 10))
+    solar_frame.columnconfigure(0, weight=1)
+    ttk.Checkbutton(
+        solar_frame,
+        text="All cars use solarcar.obj",
+        variable=solar_fleet_var,
+    ).grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        solar_frame,
+        text="Turns on solar routing, harvest, and energy sliders in the 3D viewer.",
+        style="Sub.TLabel",
+        wraplength=480,
+    ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+    ttk.Label(tab2, text="Traffic Speed (\u00d7)").grid(
+        row=3, column=0, sticky="w", padx=(8, 4), pady=(8, 2))
+    traffic_val_label = ttk.Label(tab2, text=f"{traffic_var.get():.1f}", style="Sub.TLabel")
+    traffic_val_label.grid(row=3, column=2, sticky="e", padx=(2, 8), pady=(8, 2))
+
+    def _on_traffic_scale(*_: object) -> None:
+        traffic_val_label.config(text=f"{traffic_var.get():.1f}")
+
+    traffic_scale = ttk.Scale(
+        tab2,
+        from_=0.0,
+        to=3.0,
+        orient="horizontal",
+        variable=traffic_var,
+        command=lambda _v: _on_traffic_scale(),
+    )
+    traffic_scale.grid(row=4, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 8))
+    ttk.Label(tab2, text="0 = paused", style="Sub.TLabel").grid(
+        row=5, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+
     ttk.Checkbutton(tab2, text="Show Roads", variable=roads_var).grid(
-        row=3, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+        row=6, column=0, columnspan=3, sticky="w", padx=10, pady=3)
     ttk.Checkbutton(tab2, text="Show Cars",  variable=show_cars_var).grid(
-        row=4, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+        row=7, column=0, columnspan=3, sticky="w", padx=10, pady=3)
 
     # ── TAB 3: Lighting ───────────────────────────────────────────────────────
     tab3 = ttk.Frame(notebook, padding=10)
@@ -309,8 +358,15 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
 
     _entry_row(tab3, "Streetlights (N)",  lights_var,       "2 – 40",    row=0)
     _entry_row(tab3, "Spotlight Radius",   light_radius_var, "10 – 100 m", row=1)
-    _entry_row(tab3, "Coverage Jobs",      cov_jobs_var,     "1 – 16",     row=2)
-    _entry_row(tab3, "GA Jobs",            ga_jobs_var,      "1 – 16",     row=3)
+    ttk.Label(tab3, text="Placement").grid(row=2, column=0, sticky="w", padx=(8, 4), pady=5)
+    ttk.Combobox(
+        tab3,
+        textvariable=light_strategy_var,
+        values=["smart", "ga"],
+        state="readonly",
+    ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=5)
+    _entry_row(tab3, "Coverage Jobs",      cov_jobs_var,     "1 – 16",     row=3)
+    _entry_row(tab3, "GA Jobs",            ga_jobs_var,      "1 – 16",     row=4)
 
     # ── Bottom bar ────────────────────────────────────────────────────────────
     bar = ttk.Frame(outer, style="BG.TFrame", padding=(8, 4))
@@ -356,11 +412,13 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
         args.optimize_on_open = bool(optimize_var.get())
         args.n_cars           = int(cars_var.get())
         args.car_detail       = car_detail_var.get().strip() or args.car_detail
-        args.traffic_speed    = round(float(traffic_var.get()), 1)
+        args.traffic_speed    = round(float(traffic_var.get()), 2)
         args.hide_roads       = not bool(roads_var.get())
         args.show_cars        = bool(show_cars_var.get())
+        args.solar_fleet      = bool(solar_fleet_var.get())
         args.n_lights         = int(lights_var.get())
         args.light_radius     = float(light_radius_var.get())
+        args.light_strategy   = light_strategy_var.get().strip() or args.light_strategy
         args.coverage_jobs    = int(cov_jobs_var.get())
         args.ga_jobs          = int(ga_jobs_var.get())
     except Exception as exc:

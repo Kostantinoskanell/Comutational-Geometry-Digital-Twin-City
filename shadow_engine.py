@@ -33,6 +33,14 @@ _NUMBA_KERNELS_READY = False
 import threading as _threading
 _NUMBA_WARMUP_LOCK = _threading.Lock()
 
+# Numba's default "workqueue" threading layer is NOT threadsafe: two threads
+# entering ANY parallel=True kernel concurrently abort the whole process
+# ("Concurrent access has been detected" → Fatal Python error).  Seen in
+# production when the background shadow worker and a main-thread edge-shadow
+# recompute (editor click during time-lapse) collided.  Every parallel-kernel
+# call site must hold this lock.  RLock so nested same-thread calls are safe.
+NUMBA_KERNEL_LOCK = _threading.RLock()
+
 
 # ============================================================================
 # NUMBA-COMPILED CORE FUNCTIONS (High Performance Path)
@@ -257,17 +265,19 @@ def _warmup_numba_kernels() -> None:
         tri_mins = np.min(building_triangles, axis=1)
         tri_maxs = np.max(building_triangles, axis=1)
 
-        _compute_shadows_numba(
-            centroids,
-            areas,
-            ray_dir,
-            building_triangles,
-            tri_mins,
-            tri_maxs,
-        )
+        with NUMBA_KERNEL_LOCK:
+            _compute_shadows_numba(
+                centroids,
+                areas,
+                ray_dir,
+                building_triangles,
+                tri_mins,
+                tri_maxs,
+            )
 
         illuminated = np.zeros((1,), dtype=np.bool_)
-        _compute_spotlight_coverage_numba(
+        with NUMBA_KERNEL_LOCK:
+            _compute_spotlight_coverage_numba(
             np.array([0.0, 0.0, 3.0], dtype=np.float64),
             centroids,
             np.array([0.0, 0.0, -1.0], dtype=np.float64),
@@ -525,15 +535,17 @@ def compute_shadows(
     
     print(f"Computing shadows for {n_tris} ground triangles with {building_triangles.shape[0]} building triangles...")
     _t0 = time.perf_counter()
-    # Call Numba-compiled function
-    shadowed, ratio = _compute_shadows_numba(
-        centroids.astype(np.float64),
-        areas.astype(np.float64),
-        direction.astype(np.float64),
-        building_triangles,
-        building_aabb_mins,
-        building_aabb_maxs,
-    )
+    # Call Numba-compiled function (serialized — workqueue layer aborts on
+    # concurrent access from multiple threads)
+    with NUMBA_KERNEL_LOCK:
+        shadowed, ratio = _compute_shadows_numba(
+            centroids.astype(np.float64),
+            areas.astype(np.float64),
+            direction.astype(np.float64),
+            building_triangles,
+            building_aabb_mins,
+            building_aabb_maxs,
+        )
 
     print(f"[shadow] compute_shadows: {time.perf_counter() - _t0:.3f}s for {n_tris} cells")
     return shadowed, ratio
@@ -612,17 +624,18 @@ def compute_spotlight_coverage(
         dummy_cone_cosine = -1.0  # Always passes cone check since -1.0 < any dot product
         
         # Call Numba-compiled parallel function
-        _compute_spotlight_coverage_numba(
-            light_pos,
-            centroids,
-            dummy_orientation,
-            dummy_cone_cosine,
-            building_triangles,
-            building_aabb_mins,
-            building_aabb_maxs,
-            candidate_indices,
-            illuminated,
-        )
+        with NUMBA_KERNEL_LOCK:
+            _compute_spotlight_coverage_numba(
+                light_pos,
+                centroids,
+                dummy_orientation,
+                dummy_cone_cosine,
+                building_triangles,
+                building_aabb_mins,
+                building_aabb_maxs,
+                candidate_indices,
+                illuminated,
+            )
 
     return illuminated
 
@@ -686,17 +699,18 @@ def _coverage_worker_chunk(row_indices: np.ndarray) -> tuple[np.ndarray, np.ndar
         dummy_orientation = np.array([0.0, 0.0, -1.0], dtype=np.float64)  # Omnidirectional
 
         # Call Numba-compiled parallel function per grid point
-        _compute_spotlight_coverage_numba(
-            light_pos,
-            _COV_CENTROIDS,
-            dummy_orientation,
-            _COV_CONE_COSINE,
-            _COV_BUILDING_TRIANGLES,
-            _COV_BUILDING_AABB_MINS,
-            _COV_BUILDING_AABB_MAXS,
-            cand,
-            sub[j],
-        )
+        with NUMBA_KERNEL_LOCK:
+            _compute_spotlight_coverage_numba(
+                light_pos,
+                _COV_CENTROIDS,
+                dummy_orientation,
+                _COV_CONE_COSINE,
+                _COV_BUILDING_TRIANGLES,
+                _COV_BUILDING_AABB_MINS,
+                _COV_BUILDING_AABB_MAXS,
+                cand,
+                sub[j],
+            )
 
     return idx, sub
 
@@ -770,17 +784,18 @@ def build_coverage_matrix(
             light_pos = np.array([gp[0], gp[1], pole_height], dtype=np.float64)
             dummy_orientation = np.array([0.0, 0.0, -1.0], dtype=np.float64)  # Omnidirectional
 
-            _compute_spotlight_coverage_numba(
-                light_pos,
-                centroids,
-                dummy_orientation,
-                -1.0,  # Omnidirectional: dummy cone_cosine
-                building_triangles,
-                building_aabb_mins,
-                building_aabb_maxs,
-                cand,
-                into[i],
-            )
+            with NUMBA_KERNEL_LOCK:
+                _compute_spotlight_coverage_numba(
+                    light_pos,
+                    centroids,
+                    dummy_orientation,
+                    -1.0,  # Omnidirectional: dummy cone_cosine
+                    building_triangles,
+                    building_aabb_mins,
+                    building_aabb_maxs,
+                    cand,
+                    into[i],
+                )
         return into
 
     if n_jobs is None:

@@ -691,3 +691,72 @@ def compute_ground_weights(
             candidate_mask[i] = True
     weights[candidate_mask] = 10.0
     return weights
+
+
+def _smart_light_positions(
+    ground_mesh: "pv.PolyData",
+    street_graph: "nx.MultiDiGraph",
+    n_lights: int,
+    grid_step: float,
+    seed: int,
+) -> np.ndarray:
+    """Greedy streetlight layout: prefer sidewalk/road candidates with even spacing."""
+    from app_core import _build_grid_points_from_ground_mesh
+
+    sidewalk_polygon = None
+    try:
+        sidewalk_polygon = build_sidewalk_polygon_from_street_graph(street_graph)
+    except Exception:
+        sidewalk_polygon = None
+
+    step = max(4.0, float(grid_step))
+    candidates = _build_grid_points_from_ground_mesh(
+        ground_mesh, step, sidewalk_polygon=sidewalk_polygon,
+    )
+    if candidates.shape[0] == 0 and sidewalk_polygon is not None:
+        candidates = _build_grid_points_from_ground_mesh(ground_mesh, step, sidewalk_polygon=None)
+    if candidates.shape[0] == 0:
+        raise ValueError("Ground mesh has no candidate points for smart light placement.")
+
+    candidates = np.asarray(candidates, dtype=float)
+    count = max(1, int(n_lights))
+    if candidates.shape[0] <= count:
+        return candidates.copy()
+
+    node_xy: list[tuple[float, float]] = []
+    for _, data in street_graph.nodes(data=True):
+        if "x" in data and "y" in data:
+            node_xy.append((float(data["x"]), float(data["y"])))
+    nodes = np.asarray(node_xy, dtype=float) if node_xy else candidates
+
+    center = np.mean(nodes, axis=0)
+    scene_span = float(max(np.ptp(candidates[:, 0]), np.ptp(candidates[:, 1]), 1.0))
+    density_radius = max(18.0, min(55.0, scene_span * 0.12))
+    density = np.zeros(candidates.shape[0], dtype=float)
+    for start in range(0, candidates.shape[0], 2048):
+        chunk = candidates[start:start + 2048]
+        d2 = np.sum((chunk[:, None, :] - nodes[None, :, :]) ** 2, axis=2)
+        density[start:start + chunk.shape[0]] = np.sum(d2 <= density_radius * density_radius, axis=1)
+    density = density / max(float(np.max(density)), 1.0)
+
+    center_dist = np.linalg.norm(candidates - center, axis=1)
+    center_score = 1.0 - center_dist / max(float(np.max(center_dist)), 1e-9)
+    first_idx = int(np.argmax(0.65 * density + 0.35 * center_score))
+
+    selected = [first_idx]
+    min_dist = np.linalg.norm(candidates - candidates[first_idx], axis=1)
+    rng = np.random.default_rng(int(seed))
+    jitter = rng.uniform(0.0, 1e-6, size=candidates.shape[0])
+    target_spacing = max(12.0, scene_span / max(np.sqrt(float(count)) * 1.6, 1.0))
+
+    while len(selected) < count:
+        spacing_score = np.clip(min_dist / target_spacing, 0.0, 1.0)
+        score = 0.72 * spacing_score + 0.28 * density + jitter
+        score[np.asarray(selected, dtype=np.int64)] = -np.inf
+        next_idx = int(np.argmax(score))
+        if not np.isfinite(score[next_idx]):
+            break
+        selected.append(next_idx)
+        min_dist = np.minimum(min_dist, np.linalg.norm(candidates - candidates[next_idx], axis=1))
+
+    return candidates[np.asarray(selected, dtype=np.int64)]

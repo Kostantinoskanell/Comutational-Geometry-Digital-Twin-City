@@ -34,6 +34,11 @@ car_anim["accel"]          float  (N,)  last IDM acceleration (debug/logging)
 car_anim["car_len"]        float  (N,)  bumper-to-bumper vehicle length (m)
 car_anim["enabled"]        bool         whether the car layer is active
 
+Optional per-car heterogeneity arrays (used when present):
+car_anim["idm_T_arr"]      float  (N,)  per-car time headway T
+car_anim["idm_a_arr"]      float  (N,)  per-car max acceleration a_max
+car_anim["idm_b_arr"]      float  (N,)  per-car comfortable deceleration b
+
 car_paths[i] keys: "u", "v", "length", "maxspeed_ms", "points", "cum_len"
 car_next_edges[i]: np.ndarray of int64 — path indices that follow path i
 traffic_lights: dict[node_id, TrafficLight-like]
@@ -55,6 +60,37 @@ if TYPE_CHECKING:
 
 # ── Sentinel: gap == _FREE_FLOW means no leader found (pure free-flow) ──────
 _FREE_FLOW: float = 1e30
+
+# ── Turn geometry helpers ─────────────────────────────────────────────────
+
+def _turn_angle_deg(cur_points: np.ndarray, nxt_points: np.ndarray) -> float:
+    """Angle (degrees) between the exit heading of cur_points and the entry
+    heading of nxt_points.  Returns 0 if either path has fewer than 2 points."""
+    if cur_points.shape[0] < 2 or nxt_points.shape[0] < 2:
+        return 0.0
+    v_exit  = cur_points[-1, :2] - cur_points[-2, :2]
+    v_enter = nxt_points[1,  :2] - nxt_points[0,  :2]
+    n1 = float(np.linalg.norm(v_exit))
+    n2 = float(np.linalg.norm(v_enter))
+    if n1 < 1e-9 or n2 < 1e-9:
+        return 0.0
+    cos_a = float(np.clip(np.dot(v_exit, v_enter) / (n1 * n2), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_a)))
+
+
+def _turn_speed_ms(angle_deg: float) -> float | None:
+    """Maximum safe cornering speed (m/s) for a turn of the given heading
+    change.  Returns None for bends < 20° (essentially straight)."""
+    if angle_deg < 20.0:
+        return None     # straight or slight curve — no restriction
+    elif angle_deg < 45.0:
+        return 8.3      # 30 km/h  — gentle turn
+    elif angle_deg < 90.0:
+        return 5.6      # 20 km/h  — moderate turn
+    elif angle_deg < 135.0:
+        return 3.9      # 14 km/h  — sharp turn
+    else:
+        return 2.8      # 10 km/h  — very sharp / near U-turn
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -112,21 +148,16 @@ def build_edge_car_map(
     The list for each edge is sorted in ascending dist order so index 0 is the
     rearmost car and the last entry is the frontmost (leader side).
 
-    Complexity:  O(N)  to bucket  +  O(Σ k_e log k_e) ≤ O(N log N)  to sort.
-    In practice with many short edges each bucket is tiny (1–3 cars) so the
-    sort cost is effectively O(N).
+    Complexity:  O(N log N) via numpy lexsort — faster than the original
+    O(N) bucket + O(Σ k_e log k_e) sort because the sort is done in C.
     """
+    order       = np.lexsort((dist, edge_idx))   # sort by (edge, dist)
+    s_edge      = edge_idx[order]
+    s_dist      = dist[order]
+    unique_e, first_i, counts = np.unique(s_edge, return_index=True, return_counts=True)
     ecm: dict[int, list[tuple[float, int]]] = {}
-    n = int(edge_idx.shape[0])
-    for i in range(n):
-        e = int(edge_idx[i])
-        bucket = ecm.get(e)
-        if bucket is None:
-            ecm[e] = [(float(dist[i]), i)]
-        else:
-            bucket.append((float(dist[i]), i))
-    for bucket in ecm.values():
-        bucket.sort()  # ascending by dist: follower → ... → leader
+    for e, fi, c in zip(unique_e.tolist(), first_i.tolist(), counts.tolist()):
+        ecm[e] = list(zip(s_dist[fi:fi+c].tolist(), order[fi:fi+c].tolist()))
     return ecm
 
 
@@ -177,192 +208,234 @@ def find_leaders(
     dv_arr  = np.zeros(n, dtype=float)
     at_stopline_arr = np.zeros(n, dtype=bool)
 
-    # Build the sorted-bucket map once for the whole tick (reuse in the loop).
-    ecm = build_edge_car_map(edge_idx, dist)
-    # Parallel arrays per edge for O(log k) leader lookup via bisect.
-    ecm_dists: dict[int, list[float]] = {}
-    ecm_ids: dict[int, list[int]] = {}
-    for edge, bucket in ecm.items():
-        if not bucket:
-            continue
-        ecm_dists[edge] = [float(d) for d, _ in bucket]
-        ecm_ids[edge] = [int(j) for _, j in bucket]
-
     n_paths = int(car_path_lengths.shape[0])
-    n_next = len(car_next_edges)
-    for i in range(n):
-        e      = int(edge_idx[i])
-        if e < 0 or e >= n_paths:
+    n_next  = len(car_next_edges)
+
+    # ── Junction conflict pre-pass (O(N_near_junction)) ──────────────────────
+    # Cars from DIFFERENT paths converging on the same junction node must yield
+    # to whichever car is already closest.
+    _JUNC_ZONE = 20.0
+    _junc_ghost: dict[int, float] = {}
+    _node_front: dict = {}
+    for _ji in range(n):
+        _je = int(edge_idx[_ji])
+        if _je < 0 or _je >= n_paths:
             continue
-        d_i    = float(dist[i])
-        v_i    = float(speed[i])
-        len_i  = float(car_len[i])
-        e_len  = float(car_path_lengths[e])
+        _jdte = float(car_path_lengths[_je]) - float(dist[_ji])
+        if _jdte >= _JUNC_ZONE:
+            continue
+        _jnode = car_paths[_je]["v"]
+        _nf = _node_front.get(_jnode)
+        if _nf is None:
+            _node_front[_jnode] = {_je: (_jdte, _ji)}
+        else:
+            if _je not in _nf or _jdte < _nf[_je][0]:
+                _nf[_je] = (_jdte, _ji)
+    for _jnode, _fronts in _node_front.items():
+        if len(_fronts) <= 1:
+            continue
+        _sorted_f = sorted(_fronts.values(), key=lambda x: x[0])
+        for _jdte, _jcar in _sorted_f[1:]:
+            _ghost = max(0.1, _jdte - params.s0)
+            if _jcar not in _junc_ghost or _ghost < _junc_ghost[_jcar]:
+                _junc_ghost[_jcar] = _ghost
 
-        # ── Heuristic Lane Changing ──────────────────────────────────────────
-        if desired is not None and adj_left is not None and adj_right is not None and rng is not None:
+    # ── Phase 0: Build sorted arrays + ECM dicts (for lane-changing) ─────────
+    # ECM is built once via numpy sort — faster than the per-car Python bucket loop.
+    _order0     = np.lexsort((dist, edge_idx))
+    _se0        = edge_idx[_order0]
+    _sd0        = dist[_order0]
+    _ue0, _fi0, _ec0 = np.unique(_se0, return_index=True, return_counts=True)
+    ecm_dists: dict[int, list[float]] = {}
+    ecm_ids:   dict[int, list[int]]   = {}
+    for _e, _fi, _c in zip(_ue0.tolist(), _fi0.tolist(), _ec0.tolist()):
+        ecm_dists[_e] = list(_sd0[_fi:_fi+_c])
+        ecm_ids[_e]   = list(_order0[_fi:_fi+_c].tolist())
+
+    # ── Phase 0b: Lane changing (per-car, uses+mutates ECM) ──────────────────
+    # Only runs for slow cars (v < 0.8*v0) with a tight gap ahead.
+    if desired is not None and adj_left is not None and adj_right is not None and rng is not None:
+        for i in range(n):
+            e = int(edge_idx[i])
+            if e < 0 or e >= n_paths:
+                continue
+            v_i  = float(speed[i])
             v0_i = float(desired[i])
-            if v_i < v0_i * 0.8:
-                bucket_dists = ecm_dists.get(e)
-                bucket_ids = ecm_ids.get(e)
-                curr_gap = _FREE_FLOW
-                if bucket_dists and bucket_ids:
-                    pos = bisect.bisect_right(bucket_dists, d_i + 0.01)
-                    if pos < len(bucket_dists):
-                        curr_gap = max(0.1, float(bucket_dists[pos]) - d_i - len_i)
-                
-                if curr_gap < 15.0:
-                    cand_l = int(adj_left[e])
-                    cand_r = int(adj_right[e])
-                    cands = []
-                    if cand_l >= 0: cands.append(cand_l)
-                    if cand_r >= 0: cands.append(cand_r)
-                    if cands:
-                        rng.shuffle(cands)
-                        for cand_e in cands:
-                            c_dists = ecm_dists.get(cand_e)
-                            c_ids = ecm_ids.get(cand_e)
-                            safe = True
-                            cand_gap = _FREE_FLOW
-                            if c_dists and c_ids:
-                                pos = bisect.bisect_right(c_dists, d_i + 0.01)
-                                if pos < len(c_dists):
-                                    leader_gap = max(0.1, float(c_dists[pos]) - d_i - len_i)
-                                    cand_gap = leader_gap
-                                    if leader_gap < 15.0: safe = False
-                                if safe and pos > 0:
-                                    f_d = float(c_dists[pos - 1])
-                                    f_idx = c_ids[pos - 1]
-                                    if d_i - f_d - float(car_len[f_idx]) < 5.0: safe = False
-                            if safe and cand_gap > curr_gap:
-                                # Switch lane!
-                                edge_idx[i] = cand_e
-                                e = cand_e
-                                e_len = float(car_path_lengths[e])
-                                if bucket_dists and bucket_ids:
-                                    old_pos = bisect.bisect_right(bucket_dists, d_i) - 1
-                                    if old_pos >= 0 and bucket_ids[old_pos] == i:
-                                        bucket_dists.pop(old_pos)
-                                        bucket_ids.pop(old_pos)
-                                if c_dists is None:
-                                    c_dists = []
-                                    ecm_dists[cand_e] = c_dists
-                                    c_ids = []
-                                    ecm_ids[cand_e] = c_ids
-                                new_pos = bisect.bisect_right(c_dists, d_i)
-                                c_dists.insert(new_pos, d_i)
-                                c_ids.insert(new_pos, i)
-                                break
+            if v_i >= v0_i * 0.8:
+                continue  # fast enough — skip lane-change evaluation
+            d_i   = float(dist[i])
+            len_i = float(car_len[i])
+            bucket_dists = ecm_dists.get(e)
+            bucket_ids   = ecm_ids.get(e)
+            curr_gap = _FREE_FLOW
+            if bucket_dists and bucket_ids:
+                pos = bisect.bisect_right(bucket_dists, d_i + 0.01)
+                if pos < len(bucket_dists):
+                    curr_gap = max(0.1, float(bucket_dists[pos]) - d_i - len_i)
+            if curr_gap >= 15.0:
+                continue  # wide open — no benefit to lane-change
+            cand_l = int(adj_left[e])
+            cand_r = int(adj_right[e])
+            cands = []
+            if cand_l >= 0: cands.append(cand_l)
+            if cand_r >= 0: cands.append(cand_r)
+            if not cands:
+                continue
+            rng.shuffle(cands)
+            for cand_e in cands:
+                c_dists = ecm_dists.get(cand_e)
+                c_ids   = ecm_ids.get(cand_e)
+                safe = True
+                cand_gap = _FREE_FLOW
+                if c_dists and c_ids:
+                    pos = bisect.bisect_right(c_dists, d_i + 0.01)
+                    if pos < len(c_dists):
+                        leader_gap = max(0.1, float(c_dists[pos]) - d_i - len_i)
+                        cand_gap = leader_gap
+                        if leader_gap < 15.0:
+                            safe = False
+                    if safe and pos > 0:
+                        f_d   = float(c_dists[pos - 1])
+                        f_idx = c_ids[pos - 1]
+                        if d_i - f_d - float(car_len[f_idx]) < 5.0:
+                            safe = False
+                if safe and cand_gap > curr_gap:
+                    edge_idx[i] = cand_e
+                    if bucket_dists and bucket_ids:
+                        old_p = bisect.bisect_right(bucket_dists, d_i) - 1
+                        if old_p >= 0 and bucket_ids[old_p] == i:
+                            bucket_dists.pop(old_p)
+                            bucket_ids.pop(old_p)
+                    if c_dists is None:
+                        c_dists = []; ecm_dists[cand_e] = c_dists
+                        c_ids = [];   ecm_ids[cand_e]   = c_ids
+                    new_p = bisect.bisect_right(c_dists, d_i)
+                    c_dists.insert(new_p, d_i)
+                    c_ids.insert(new_p, i)
+                    break
 
-        best_gap: float = _FREE_FLOW
-        best_dv:  float = 0.0
+    # ── Phase 1: Vectorized same-edge leader ─────────────────────────────────
+    # Resort after lane-changing (edge_idx may have changed for some cars).
+    # O(N log N) numpy — replaces 600-car Python bisect loop.
+    order        = np.lexsort((dist, edge_idx))
+    sorted_edge  = edge_idx[order]
+    sorted_dist  = dist[order]
+    sorted_speed = speed[order]
+    sorted_clen  = car_len[order]
 
-        # ── Priority 1: same-edge leader ─────────────────────────────────────
-        # Jump directly to first car strictly ahead using binary search.
-        bucket_dists = ecm_dists.get(e)
-        bucket_ids = ecm_ids.get(e)
-        if bucket_dists is not None and bucket_ids is not None:
-            leader_pos = bisect.bisect_right(bucket_dists, d_i + 0.01)
-            if leader_pos < len(bucket_dists):
-                d_j = float(bucket_dists[leader_pos])
-                j = int(bucket_ids[leader_pos])
-                g = max(0.1, d_j - d_i - len_i)
-                if g < best_gap:
-                    best_gap = g
-                    best_dv = v_i - max(0.0, float(speed[j]))
+    # has_se[k] = True when sorted car k has an immediate same-edge leader at k+1
+    has_se = np.zeros(n, dtype=bool)
+    if n > 1:
+        has_se[:-1] = sorted_edge[:-1] == sorted_edge[1:]
 
-        # ── Priority 2: cross-edge leader ────────────────────────────────────
-        # If no same-edge leader, look at the frontmost car on each next edge.
-        # Choose the candidate that gives the smallest gap.
-        if best_gap == _FREE_FLOW and e < n_next:
-            dist_to_end = e_len - d_i
-            for ne_raw in car_next_edges[e]:
-                ne = int(ne_raw)
-                next_dists = ecm_dists.get(ne)
-                next_ids = ecm_ids.get(ne)
-                if not next_dists or not next_ids:
+    fol = np.where(has_se)[0]
+    if fol.size > 0:
+        led    = fol + 1
+        se_gap = np.maximum(0.1, sorted_dist[led] - sorted_dist[fol] - sorted_clen[fol])
+        se_dv  = sorted_speed[fol] - np.maximum(0.0, sorted_speed[led])
+        gap_arr[order[fol]] = se_gap
+        dv_arr[order[fol]]  = se_dv
+
+    # ── Phase 1b: Per-edge frontmost car (O(N) numpy scatter) ────────────────
+    # Used by cross-edge and roundabout phases — no ECM dict lookup needed.
+    edge_front_dist  = np.full(n_paths, -np.inf, dtype=float)
+    edge_front_speed = np.zeros(n_paths, dtype=float)
+    # Last car in sorted order for each edge = frontmost car on that edge
+    last_sorted = np.where(~has_se)[0]
+    _valid      = (sorted_edge[last_sorted] >= 0) & (sorted_edge[last_sorted] < n_paths)
+    _lo         = last_sorted[_valid]
+    if _lo.size > 0:
+        edge_front_dist[sorted_edge[_lo]]  = sorted_dist[_lo]
+        edge_front_speed[sorted_edge[_lo]] = sorted_speed[_lo]
+
+    # ── Phase 2: Cross-edge leader (only for cars still at FREE_FLOW) ─────────
+    no_se = np.where(gap_arr >= _FREE_FLOW)[0]
+    for i in no_se:
+        e = int(edge_idx[i])
+        if e < 0 or e >= n_paths or e >= n_next:
+            continue
+        dist_to_end = float(car_path_lengths[e]) - float(dist[i])
+        v_i   = float(speed[i])
+        len_i = float(car_len[i])
+        for ne_raw in car_next_edges[e]:
+            ne = int(ne_raw)
+            if ne < 0 or ne >= n_paths or edge_front_dist[ne] <= -np.inf:
+                continue
+            g = max(0.1, dist_to_end + float(edge_front_dist[ne]) - len_i)
+            if g < gap_arr[i]:
+                gap_arr[i] = g
+                dv_arr[i]  = v_i - max(0.0, float(edge_front_speed[ne]))
+
+    # ── Phase 3: Vectorized TL ghost leader ───────────────────────────────────
+    # O(n_paths) Python loop + O(N) numpy — replaces 600-car per-car TL lookup.
+    can_enter_path = np.ones(n_paths, dtype=bool)
+    for pidx in range(n_paths):
+        _node_id = car_paths[pidx]["v"]
+        _tl = traffic_lights.get(_node_id)
+        if _tl is not None and pidx in _tl.controlled_paths and not _tl.can_enter(pidx):
+            can_enter_path[pidx] = False
+
+    e_arr       = np.clip(edge_idx, 0, n_paths - 1)
+    car_blocked = ~can_enter_path[e_arr]
+    stopline_d  = car_path_lengths[e_arr] - dist
+    ghost_gap_v = np.maximum(0.1, stopline_d - params.s0)
+
+    at_stop = car_blocked & (stopline_d <= 1e-3)
+    at_stopline_arr |= at_stop
+    # Hold cars already at the stop line
+    gap_arr[at_stop] = _FREE_FLOW
+    dv_arr[at_stop]  = 0.0
+    # Inject ghost for cars approaching red
+    ghost_better = car_blocked & ~at_stop & (ghost_gap_v < gap_arr)
+    gap_arr = np.where(ghost_better, ghost_gap_v, gap_arr)
+    dv_arr  = np.where(ghost_better, speed, dv_arr)
+
+    # ── Phase 3b: Stop signs (per-car, only cars near stop-sign edges) ────────
+    if stop_wait is not None:
+        for i in range(n):
+            e = int(edge_idx[i])
+            if e < 0 or e >= n_paths or car_paths[e].get("control") != "stop":
+                continue
+            sl_dist = float(car_path_lengths[e]) - float(dist[i])
+            if sl_dist >= 15.0:
+                continue
+            v_i = float(speed[i])
+            if sl_dist < params.s0 + 1.0 and v_i < 0.1:
+                stop_wait[i] += dt
+            if stop_wait[i] < 2.0:
+                g = max(0.1, sl_dist - params.s0)
+                if g < gap_arr[i]:
+                    gap_arr[i] = g
+                    dv_arr[i]  = v_i
+                    at_stopline_arr[i] = (sl_dist <= 1e-3)
+
+    # ── Phase 4: Roundabout yield (per-car, only yield-map edges) ────────────
+    if roundabout_yield_map is not None:
+        for i in range(n):
+            e = int(edge_idx[i])
+            if e not in roundabout_yield_map or gap_arr[i] < _FREE_FLOW:
+                continue
+            ring_edges = roundabout_yield_map[e]
+            e_len = float(car_path_lengths[e])
+            d_i   = float(dist[i])
+            v_i   = float(speed[i])
+            for re in ring_edges:
+                re = int(re)
+                if re < 0 or re >= n_paths or edge_front_dist[re] <= -np.inf:
                     continue
-                d_j = float(next_dists[-1])
-                j = int(next_ids[-1])
-                g = max(0.1, dist_to_end + float(d_j) - len_i)
-                if g < best_gap:
-                    best_gap = g
-                    best_dv  = v_i - max(0.0, float(speed[j]))
+                dist_to_conflict = float(car_path_lengths[re]) - float(edge_front_dist[re])
+                if dist_to_conflict < 15.0:
+                    g = max(0.1, e_len - d_i - 0.5)
+                    if g < gap_arr[i]:
+                        gap_arr[i] = g
+                        dv_arr[i]  = v_i
 
-        # ── Priority 3: ghost leader at red/yellow stop line ─────────────────
-        # Phantom stationary "car" placed params.s0 before the stop line so
-        # the IDM brakes the car to rest exactly at the line.
-        # Overrides a real leader only when the ghost is closer.
-        node_id = car_paths[e]["v"]
-        tl = traffic_lights.get(node_id)
-        if tl is not None and e in tl.controlled_paths and not tl.can_enter(e):
-            stopline_dist = e_len - d_i
-            if stopline_dist <= 1e-3:
-                # Avoid ghost-gap singularity when already clamped at stop line.
-                at_stopline_arr[i] = True
-                best_gap = _FREE_FLOW
-                best_dv = 0.0
-                
-        # ── Priority 3b: Stop signs ──────────────────────────────────────────
-        # If the intersection is controlled by a stop sign, the car must
-        # halt, wait 2 seconds, and then it can proceed.
-        if car_paths[e].get("control") == "stop" and stop_wait is not None:
-            stopline_dist = e_len - d_i
-            # If within 15 meters of the stop line, start evaluating stop logic
-            if stopline_dist < 15.0:
-                # Are we physically stopped at the line?
-                if stopline_dist < params.s0 + 1.0 and v_i < 0.1:
-                    stop_wait[i] += dt
-                
-                if stop_wait[i] < 2.0:
-                    # Still need to wait, inject ghost leader at stopline
-                    ghost_gap = max(0.1, stopline_dist - params.s0)
-                    if ghost_gap < best_gap:
-                        best_gap = ghost_gap
-                        best_dv = v_i
-                        at_stopline_arr[i] = (stopline_dist <= 1e-3)
-                else:
-                    # Wait time fulfilled! Allow it to proceed (unless there is cross traffic).
-                    # (For a complete yield, we'd check conflicts. For now, 2s wait suffices).
-                    pass
-                
-        # ── Priority 4: Roundabout Yield Logic ───────────────────────────────
-        # If this car is about to enter a roundabout, check for cars already on the ring
-        # that are approaching the same entry node.
-        if best_gap == _FREE_FLOW and roundabout_yield_map is not None:
-            if e in roundabout_yield_map:
-                ring_edges = roundabout_yield_map[e]
-                # Look at cars on the ring edges
-                for re in ring_edges:
-                    r_dists = ecm_dists.get(re)
-                    r_ids = ecm_ids.get(re)
-                    if not r_dists or not r_ids:
-                        continue
-                    # A car is approaching the node if it's on this ring edge.
-                    # We check the closest one to the entry node (which is the leader of the ring edge).
-                    # Actually, the frontmost car is r_dists[-1]
-                    d_r = float(r_dists[-1])
-                    j = int(r_ids[-1])
-                    r_len = float(car_path_lengths[re])
-                    dist_to_conflict = r_len - d_r
-                    
-                    # If a car is within 15 meters of the conflict point, yield to it.
-                    if dist_to_conflict < 15.0:
-                        # Inject a ghost leader at the entry node.
-                        stopline_dist = e_len - d_i
-                        g = max(0.1, stopline_dist - 0.5)
-                        if g < best_gap:
-                            best_gap = g
-                            best_dv = v_i  # Brake to stop
-                best_dv = 0.0
-            else:
-                ghost_gap = max(0.1, stopline_dist - params.s0)
-                if ghost_gap < best_gap:
-                    best_gap = ghost_gap
-                    best_dv  = v_i            # v_leader = 0  ⟹  Δv = v_self
-
-        gap_arr[i] = best_gap
-        dv_arr[i]  = best_dv
+    # ── Phase 5: Junction conflict ghost ─────────────────────────────────────
+    for _jcar, _jg in _junc_ghost.items():
+        _jg_f = float(_jg)
+        if _jg_f < gap_arr[_jcar]:
+            gap_arr[_jcar] = _jg_f
+            dv_arr[_jcar]  = float(speed[_jcar])
 
     return gap_arr, dv_arr, at_stopline_arr
 
@@ -377,6 +450,9 @@ def idm_accelerations(
     gap:     np.ndarray,   # (N,) bumper-to-bumper gap (_FREE_FLOW = none)
     dv:      np.ndarray,   # (N,) approach rate (0 for free-flow cars)
     params:  IDMParams,
+    a_arr:   np.ndarray | None = None,   # (N,) per-car max accel (overrides params.a_max)
+    b_arr:   np.ndarray | None = None,   # (N,) per-car decel (overrides params.b)
+    T_arr:   np.ndarray | None = None,   # (N,) per-car time headway (overrides params.T)
 ) -> np.ndarray:
     """Fully vectorised IDM acceleration for all N cars.
 
@@ -399,6 +475,12 @@ def idm_accelerations(
 
     has_leader = gap < _FREE_FLOW     # bool (N,)
 
+    # Per-car parameter arrays (fall back to scalar params when not provided)
+    _a_max = a_arr if a_arr is not None else params.a_max
+    _b     = b_arr if b_arr is not None else params.b
+    _T     = T_arr if T_arr is not None else params.T
+    _sqrt_ab = np.sqrt(_a_max * _b) if a_arr is not None or b_arr is not None else params.sqrt_ab
+
     # ── Free-flow deceleration term (applies to every car) ───────────────────
     free_term = (speed / v0_safe) ** params.delta
 
@@ -407,14 +489,14 @@ def idm_accelerations(
     # for all because np.where zeroes out the interaction term below.
     s_star = params.s0 + np.maximum(
         0.0,
-        speed * params.T + speed * dv / (2.0 * params.sqrt_ab),
+        speed * _T + speed * dv / (2.0 * _sqrt_ab),
     )
 
     # ── Interaction term — zero for free-flow cars ────────────────────────
     interaction_term = np.where(has_leader, (s_star / g_safe) ** 2, 0.0)
 
-    a = params.a_max * (1.0 - free_term - interaction_term)
-    return np.clip(a, -params.b * 3.0, params.a_max)
+    a = _a_max * (1.0 - free_term - interaction_term)
+    return np.clip(a, -_b * 3.0, _a_max)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -532,7 +614,19 @@ def _advance_positions(
             new_v0 = new_base_v0 * float(traffic_speed)
             desired_base[i] = new_base_v0
             desired[i] = new_v0
-            speed[i]   = min(float(speed[i]), new_v0)
+
+            # Hard-clamp entry speed to turn cornering limit.
+            # This covers cars whose plan wasn't known at the pre-braking pass and
+            # ensures speed never exceeds safe cornering speed at the junction.
+            if car_paths[cidx].get("junction") != "roundabout":
+                _v_turn = _turn_speed_ms(
+                    _turn_angle_deg(car_paths[cidx]["points"],
+                                    car_paths[int(edge_idx[i])]["points"])
+                )
+                if _v_turn is not None:
+                    speed[i] = min(float(speed[i]), _v_turn)
+
+            speed[i] = min(float(speed[i]), new_v0)
             hops += 1
 
         # If we hit the hop cap, carry leftover distance onto current edge (clamped).
@@ -556,9 +650,11 @@ def idm_tick(
     rng:            np.random.Generator,
     traffic_speed: float = 1.0,
     roundabout_yield_map: dict[int, np.ndarray] | None = None,
+    adj_left:  np.ndarray | None = None,   # (P,) int64, adjacent lane left
+    adj_right: np.ndarray | None = None,   # (P,) int64, adjacent lane right
 ) -> None:
     """Full IDM simulation tick. Mutates car_anim in-place.
-    
+
     Parameters
     ----------
     car_anim       : shared animation state dict
@@ -598,14 +694,63 @@ def idm_tick(
     # ── Step 2: Build edge → sorted-car map ──────────────────────────────────
     # (Implicitly done inside find_leaders; exposed separately for reuse.)
 
+    # ── Step 2b: Turn approach — lower desired speed before a sharp corner ───
+    # When a car is within TURN_LOOKAHEAD metres of its edge end, look ahead to
+    # the next edge, compute the heading change, and reduce desired[i] to the
+    # cornering speed limit.  IDM then decelerates naturally before the junction;
+    # the hard clamp at crossing time (in _advance_positions) acts as a safety net.
+    # desired_base is NOT touched so the car re-accelerates normally on the new edge.
+    _TURN_LOOKAHEAD = 18.0  # metres
+    _planned_edges_snap  = car_anim.get("planned_edges")
+    _planned_cursor_snap = car_anim.get("planned_cursor")
+    _n_planned = len(_planned_edges_snap) if _planned_edges_snap is not None else 0
+    n_cars = int(edge_idx.shape[0])
+    n_next = len(car_next_edges)
+
+    # Vectorized filter — only iterate cars within TURN_LOOKAHEAD of edge end.
+    # Replaces O(N) loop where most cars skip via `_dist_to_end > _TURN_LOOKAHEAD`.
+    # Build roundabout flag per PATH (O(n_paths) Python) then index per CAR (O(N) numpy).
+    _is_ra_path = (np.array([p.get("junction") == "roundabout" for p in car_paths], dtype=bool)
+                   if n_paths > 0 else np.zeros(0, dtype=bool))
+    _e_clip  = np.clip(edge_idx, 0, max(n_paths - 1, 0))
+    _dte_all = car_path_lengths[_e_clip] - dist    # (N,) dist to edge end
+    _near    = (edge_idx >= 0) & (edge_idx < n_paths) & ~_is_ra_path[_e_clip] & (_dte_all <= _TURN_LOOKAHEAD)
+    for _i in np.where(_near)[0]:
+        _cidx = int(edge_idx[_i])
+        _next_e: int | None = None
+        if _planned_edges_snap is not None and _planned_cursor_snap is not None and _i < _n_planned:
+            try:
+                _plan = _planned_edges_snap[_i]
+                if _plan is not None:
+                    _pa  = np.asarray(_plan, dtype=np.int64)
+                    _cur = int(np.clip(int(_planned_cursor_snap[_i]), 0, _pa.size - 1))
+                    if _pa.size > 0 and int(_pa[_cur]) != _cidx:
+                        _m = np.flatnonzero(_pa == _cidx)
+                        if _m.size > 0:
+                            _cur = int(_m[0])
+                    if _cur + 1 < _pa.size:
+                        _next_e = int(_pa[_cur + 1])
+            except Exception:
+                pass
+        if _next_e is None and _cidx < n_next and car_next_edges[_cidx].size > 0:
+            _next_e = int(car_next_edges[_cidx][0])
+        if _next_e is None or _next_e < 0 or _next_e >= n_paths:
+            continue
+        _angle = _turn_angle_deg(car_paths[_cidx]["points"], car_paths[_next_e]["points"])
+        _v_lim = _turn_speed_ms(_angle)
+        if _v_lim is not None and _v_lim < desired[_i]:
+            desired[_i] = _v_lim  # IDM sees reduced v₀ → brakes smoothly
+
     # ── Step 3: Leader lookup + ghost-leader injection ───────────────────────
     stop_wait = np.array(car_anim["stop_wait"], dtype=float)
-    
+
     gap, dv, at_stopline = find_leaders(
         edge_idx, dist, speed, car_len,
         car_path_lengths, car_next_edges, car_paths,
         traffic_lights, params,
         desired=desired,
+        adj_left=adj_left,
+        adj_right=adj_right,
         rng=rng,
         roundabout_yield_map=roundabout_yield_map,
         stop_wait=stop_wait,
@@ -613,7 +758,10 @@ def idm_tick(
     )
 
     # ── Step 4: Vectorised IDM accelerations — no Python loop ────────────────
-    accel = idm_accelerations(speed, desired, gap, dv, params)
+    _a_arr = np.asarray(car_anim["idm_a_arr"], dtype=float) if "idm_a_arr" in car_anim else None
+    _b_arr = np.asarray(car_anim["idm_b_arr"], dtype=float) if "idm_b_arr" in car_anim else None
+    _T_arr = np.asarray(car_anim["idm_T_arr"], dtype=float) if "idm_T_arr" in car_anim else None
+    accel = idm_accelerations(speed, desired, gap, dv, params, a_arr=_a_arr, b_arr=_b_arr, T_arr=_T_arr)
 
     # ── Step 5: Velocity update (symplectic Euler: all v before any x) ───────
     #   v_new = clip( v + a·dt,  lower=0,  upper=v₀ )
@@ -640,3 +788,58 @@ def idm_tick(
     car_anim["desired_speed_base"] = desired_base
     car_anim["accel"]         = accel
     car_anim["stop_wait"]     = stop_wait
+
+    # ── Step 8: Deadlock recovery — teleport cars stuck > 8 s ────────────────
+    # Cars that have been at near-zero speed while near a leader (junction ghost
+    # or traffic light) for more than 8 seconds are teleported to a random edge
+    # start.  This breaks circular deadlocks that the junction-yield pre-pass
+    # cannot resolve when two cars are exactly equidistant from the conflict node.
+    _STUCK_THRESH_S  = 8.0    # seconds before teleport
+    _STUCK_SPEED_MS  = 0.12   # m/s: below this counts as "stopped"
+    _STUCK_GAP_M     = 25.0   # only count stuck if within this gap of a leader
+
+    n_cars = int(edge_idx.shape[0])
+    stuck_time = np.asarray(
+        car_anim.setdefault("stuck_time", np.zeros(n_cars, dtype=float)),
+        dtype=float,
+    )
+    if stuck_time.shape[0] != n_cars:
+        stuck_time = np.zeros(n_cars, dtype=float)
+
+    # Exempt cars legitimately waiting at a red light — they are stopped
+    # intentionally and should never be treated as deadlocked.
+    _can_enter = np.ones(n_paths, dtype=bool)
+    for _pidx in range(n_paths):
+        _nid = car_paths[_pidx]["v"]
+        _tl = traffic_lights.get(_nid)
+        if (_tl is not None
+                and _pidx in _tl.controlled_paths
+                and not _tl.can_enter(_pidx)):
+            _can_enter[_pidx] = False
+    _tl_blocked = ~_can_enter[np.clip(edge_idx, 0, n_paths - 1)]
+
+    stopped_mask = (speed < _STUCK_SPEED_MS) & (gap < _STUCK_GAP_M) & ~_tl_blocked
+    stuck_time[stopped_mask]  += float(dt)
+    stuck_time[~stopped_mask]  = 0.0
+
+    deadlocked = np.where(stuck_time > _STUCK_THRESH_S)[0]
+    if deadlocked.size > 0 and n_paths > 0:
+        new_edges = rng.integers(0, n_paths, size=deadlocked.size)
+        edge_idx[deadlocked] = new_edges
+        dist[deadlocked]     = 0.0
+        # Resample speed from new edge limit
+        for _di, _ne in zip(deadlocked, new_edges):
+            new_v0 = (float(car_paths[int(_ne)]["maxspeed_ms"])
+                      * float(rng.uniform(0.7, 1.0)))
+            desired_base[_di] = new_v0
+            desired[_di]      = new_v0 * float(traffic_speed)
+            speed[_di]        = new_v0 * 0.3
+        stuck_time[deadlocked] = 0.0
+        # Write back position arrays immediately after teleport
+        car_anim["edge_idx"]           = edge_idx
+        car_anim["dist"]               = dist
+        car_anim["speed"]              = speed
+        car_anim["desired_speed"]      = desired
+        car_anim["desired_speed_base"] = desired_base
+
+    car_anim["stuck_time"] = stuck_time

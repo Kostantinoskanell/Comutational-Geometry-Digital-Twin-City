@@ -103,8 +103,11 @@ class TrafficLight:
     def __post_init__(self):
         self.controlled_paths = frozenset(idx for group in self.green_groups for idx in group)
         self._refresh_allowed()
-        # Apply offset: advance clock so lights start mid-cycle
-        self._advance(self.offset % (GREEN_DURATION + YELLOW_DURATION + ALL_RED_PAUSE))
+        # Advance by the full offset so lights start at different points in their cycle.
+        # Use the actual per-phase durations (not the module-level defaults) so the modulo
+        # is correct even when green_durations differ from GREEN_DURATION.
+        _cycle = sum(self.green_durations) + sum(self.yellow_durations) + self.n_phases * ALL_RED_PAUSE
+        self._advance(self.offset % max(_cycle, 1.0))
 
     def _refresh_allowed(self):
         if self.state == "green":
@@ -114,9 +117,13 @@ class TrafficLight:
             self._allowed = set()
 
     def _advance(self, dt: float):
-        """Advance clock by dt without updating external state (used for offset)."""
+        """Advance clock by dt, draining through as many state transitions as needed."""
         self.elapsed += dt
-        self._tick_inner()
+        for _ in range(100):
+            old = self.elapsed
+            self._tick_inner()
+            if abs(self.elapsed - old) < 1e-9:
+                break
 
     def _tick_inner(self):
         idx = self.phase % max(1, len(self.green_groups))
@@ -168,6 +175,63 @@ class TrafficLight:
         return "red"
 
 
+# ── Smart phase timing ────────────────────────────────────────────────────
+
+# Green-time bounds (seconds).  Even a tiny side street holds green long enough
+# to clear a couple of cars; a fast arterial gets a generous window.
+_GREEN_MIN = 14.0
+_GREEN_MAX = 45.0
+# Yellow-time bounds (seconds).  ITE clearance ≈ reaction + v / (2·decel).
+_YELLOW_MIN = 3.0
+_YELLOW_MAX = 5.5
+_DECEL = 3.0          # m/s² assumed comfortable braking for yellow calc
+_REACTION = 1.0       # s driver reaction time
+
+
+def _group_speed_ms(group: list[int], car_paths: list[dict]) -> float:
+    """Max posted speed (m/s) among the paths in one phase group.
+
+    Falls back to 8.33 m/s (30 km/h) for an empty group or missing data.
+    """
+    best = 0.0
+    for path_idx in group:
+        if 0 <= path_idx < len(car_paths):
+            v = float(car_paths[path_idx].get("maxspeed_ms", 0.0) or 0.0)
+            if v > best:
+                best = v
+    return best if best > 0.0 else 8.33
+
+
+def _phase_timings(
+    groups: list[list[int]],
+    car_paths: list[dict],
+) -> tuple[list[float], list[float]]:
+    """Return (green_durations, yellow_durations), one entry per phase group.
+
+    Green time scales linearly with the group's share of total approach speed,
+    so the faster axis at the junction holds green longer.  Yellow time follows
+    the ITE clearance formula t_y = reaction + v / (2·decel), clamped to a sane
+    urban band.
+    """
+    speeds = [_group_speed_ms(g, car_paths) for g in groups]
+    total = sum(speeds) if speeds else 0.0
+
+    green_durations: list[float] = []
+    yellow_durations: list[float] = []
+    for v in speeds:
+        if total > 1e-6:
+            share = v / total                       # 0..1, sums to 1 over phases
+            green = _GREEN_MIN + (_GREEN_MAX - _GREEN_MIN) * share
+        else:
+            green = (_GREEN_MIN + _GREEN_MAX) * 0.5
+        green_durations.append(float(np.clip(green, _GREEN_MIN, _GREEN_MAX)))
+
+        yellow = _REACTION + v / (2.0 * _DECEL)
+        yellow_durations.append(float(np.clip(yellow, _YELLOW_MIN, _YELLOW_MAX)))
+
+    return green_durations, yellow_durations
+
+
 # ── Build traffic lights from graph ──────────────────────────────────────
 
 def build_traffic_lights(
@@ -207,47 +271,37 @@ def build_traffic_lights(
         # (or added via the editor). We ignore the min_degree rule unless it's a fallback.
         # But wait! If the user wants actual logic and Stop signs, we should allow them.
         if control_type == "traffic_signals":
-            # Real traffic light!
-            pass
+            pass  # explicit OSM traffic signal
         elif control_type == "stop":
-            # We don't build a TrafficLight for Stop signs, the IDM will handle `control="stop"`.
-            # But we might need a StopSign FSM later. For now, skip TrafficLight generation.
-            continue
+            continue  # stop signs handled by IDM stop-wait logic, not FSM
         else:
-            # Fallback: if not tagged but it's a huge intersection, we could auto-place it.
-            # Let's trust the OSMnx tags we just fetched!
-            continue
+            # Fallback: auto-place a light at any significant intersection (3+ incoming paths)
+            # that isn't explicitly tagged. This ensures lights appear regardless of OSM
+            # tagging density in the loaded area.
+            if len(in_edges) < 3:
+                continue
             
         n_phases = 2 if len(in_edges) >= 3 else 1
         groups = _group_edges_by_axis(in_edges, n_phases=n_phases)
+        if n_phases == 1:
+            # Mid-block / straight-road signal (≤2 approaches on one axis,
+            # e.g. an editor-placed light on a plain road).  A single-phase
+            # light is green for the whole cycle minus the ~1.5 s all-red
+            # pause — useless.  Model it as a pedestrian crossing instead:
+            # alternate cars-green with an all-red phase.  The empty group
+            # gets share=0 in _phase_timings → _GREEN_MIN (14 s) of red.
+            groups = [groups[0], []]
+            n_phases = 2
 
-        # Calculate smart time windows based on incoming max speed
-        green_durations = []
-        yellow_durations = []
-        for g_idx, group in enumerate(groups):
-            max_speed = 30.0 # fallback
-            if len(group) > 0:
-                # Find the maximum speed limit among the paths in this phase group
-                # car_paths has maxspeed, but we only have graph data here.
-                # Actually, let's use the edge attributes.
-                max_speed_kmh = 30.0
-                for path_idx in group:
-                    # we don't have direct access to car_paths in build_traffic_lights!
-                    pass
-                # Approximate based on highway tags instead
-                is_major_phase = False
-                for path_idx in group:
-                    # find edge data for path_idx
-                    for _, u, v, _ in in_edges:
-                        if _ == path_idx:
-                            edgedata = graph.get_edge_data(u, v)
-                            # ... skipping deep lookup, assume 50 for major, 30 for minor
-                            is_major_phase = True # simplified
-            # Assign timings
-            green_durations.append(35.0 if g_idx == 0 else 15.0)  # Primary phase 35s, secondary 15s
-            yellow_durations.append(4.0)
+        # ── Smart time windows from real per-phase road speed ────────────────
+        # car_paths IS available here (it's a parameter), so look up the actual
+        # maxspeed_ms of each path in each phase group.  The faster/busier axis
+        # gets a proportionally longer green; faster approaches get a longer
+        # yellow (clearance time grows with approach speed).
+        green_durations, yellow_durations = _phase_timings(groups, car_paths)
 
         ndata = graph.nodes.get(node_id, {})
+        _cycle = sum(green_durations) + sum(yellow_durations) + n_phases * ALL_RED_PAUSE
         light = TrafficLight(
             node_id=node_id,
             x=float(ndata.get("x", 0.0)),
@@ -256,7 +310,7 @@ def build_traffic_lights(
             green_durations=green_durations,
             yellow_durations=yellow_durations,
             n_phases=n_phases,
-            offset=float(rng.uniform(0, sum(green_durations) + sum(yellow_durations))),
+            offset=float(rng.uniform(0, _cycle)),
         )
         approach_points: dict[int, tuple[float, float, float]] = {}
         vx = float(ndata.get("x", 0.0))

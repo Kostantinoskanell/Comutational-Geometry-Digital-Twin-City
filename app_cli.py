@@ -44,6 +44,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-lights", type=int, default=12, help="Number of streetlights for GA mode.")
     parser.add_argument("--n-cars", type=int, default=-1, help="Number of animated cars (-1 for auto-density).")
+    parser.add_argument("--n-peds", type=int, default=-1, help="Number of pedestrian agents (-1 for auto, 50–200).")
+    parser.add_argument("--n-cyclists", type=int, default=-1, help="Number of cyclist agents (-1 for auto, 10–60).")
+    parser.add_argument("--n-parked-cars", type=int, default=-1,
+                        help="Parked cars placed in OSM parking lots (-1 = auto, ≈ buildings × 0.25).")
+    parser.add_argument("--gtfs", type=str, default="", help="Path to GTFS directory or .zip archive for bus simulation.")
+    parser.add_argument("--n-buses", type=int, default=-1, help="Max bus agents from GTFS (-1 = up to 30).")
+    parser.add_argument("--gtfs-rt-url", type=str, default="", help="GTFS-Realtime VehiclePositions feed URL for LIVE bus positions.")
+    parser.add_argument("--gtfs-rt-key", type=str, default="", help="API key for the GTFS-RT feed (sent as Authorization/api_key header).")
+    parser.add_argument("--gtfs-rt-key-param", type=str, default="", help="If set, send the API key as this query parameter instead of a header.")
+    parser.add_argument("--gtfs-rt-interval", type=float, default=15.0, help="Seconds between GTFS-RT feed polls (min 2).")
+    parser.add_argument("--sumo-cfg", type=str, default="", help="Path to a .sumocfg to enable SUMO co-simulation (SUMO drives vehicles, app renders).")
+    parser.add_argument("--sumo-net", type=str, default="", help="Explicit SUMO .net.xml (else read from the .sumocfg). Must be geo-referenced.")
+    parser.add_argument("--sumo-binary", type=str, default="sumo", help="SUMO binary name or path (default 'sumo').")
+    parser.add_argument("--sumo-gui", action="store_true", help="Launch sumo-gui alongside (shows SUMO's own window too).")
+    parser.add_argument("--sumo-step", type=float, default=0.1, help="SUMO simulation step length in seconds (default 0.1).")
+    parser.add_argument("--sumo-port", type=int, default=0, help="TraCI port (0 = let traci pick one).")
+    parser.add_argument(
+        "--engine",
+        choices=["idm", "sumo"],
+        default="idm",
+        help=(
+            "Traffic engine: 'idm' (built-in Intelligent Driver Model, default) or 'sumo' "
+            "(SUMO co-simulation as the primary traffic source). In sumo mode, all overlays "
+            "(heatmap, noise, AQ) read from the SUMO snapshot. If --sumo-cfg is not given, "
+            "the scene is built automatically from --address/--radius and cached for reuse. "
+            "Degrades gracefully to idm with a warning if SUMO deps are missing."
+        ),
+    )
+    parser.add_argument("--validate-od", type=int, default=0, help="Validate model travel times against a routing engine over N random O-D pairs (0 = off).")
+    parser.add_argument("--validate-engine", type=str, default="osrm", help="Reference routing engine for --validate-od (currently 'osrm', no API key).")
+    parser.add_argument("--validate-osrm-host", type=str, default="https://router.project-osrm.org", help="OSRM host for travel-time validation.")
+    parser.add_argument("--validate-congested", metavar="N", type=int, default=0,
+                       help="Compare simulated congested travel times vs OSRM over N O-D pairs (requires active traffic)")
+    parser.add_argument("--validate-engines", metavar="N", type=int, default=0,
+                       help="Compare IDM vs SUMO travel times over N shared O-D pairs (requires --engine sumo)")
     parser.add_argument("--solo", action="store_true", help="Run with a single solar car and display live energy telemetry.")
     parser.add_argument(
         "--car-detail",
@@ -159,6 +194,46 @@ def parse_args() -> argparse.Namespace:
         choices=["overture", "osm"],
         default="overture",
         help="Data source for buildings and street graph (default: overture).",
+    )
+    parser.add_argument(
+        "--no-dem",
+        dest="use_dem",
+        action="store_false",
+        default=True,
+        help="Skip Copernicus DEM terrain fetch (faster startup, flat ground).",
+    )
+    parser.add_argument(
+        "--no-ms-buildings",
+        dest="use_ms_buildings",
+        action="store_false",
+        default=True,
+        help="Skip Microsoft Building Footprints height fetch (faster startup, OSM heights only).",
+    )
+    # ── Profiling ─────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable profiling mode: run for --profile-duration seconds, record per-frame "
+            "timings split into idm_sim / vtk_actors / render / overlay / event_pump, "
+            "print a summary table, and save profile_report.json. "
+            "Use --n-cars to set the car count (default 200 when --profile is active)."
+        ),
+    )
+    parser.add_argument(
+        "--profile-duration",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Seconds to run before auto-exiting in --profile mode (default: 60).",
+    )
+    parser.add_argument(
+        "--profile-output",
+        type=str,
+        default="profile_report.json",
+        metavar="PATH",
+        help="Output path for the JSON profile report (default: profile_report.json).",
     )
     return parser.parse_args()
 

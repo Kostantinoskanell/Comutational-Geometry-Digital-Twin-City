@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ψηφιακό Δίδυμο Πόλης — Παρουσίαση</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg: #0f1419; --card: #1a2129; --accent: #4fc3f7; --accent2: #ffb74d;
+    --green: #81c784; --red: #e57373; --text: #e8eaed; --dim: #9aa5b1;
+  }
+  html, body { height: 100%; background: var(--bg); color: var(--text);
+    font-family: "Helvetica Neue", Arial, sans-serif; overflow: hidden; }
+  .slide { display: none; height: 100vh; padding: 5vh 7vw; flex-direction: column; justify-content: center; }
+  .slide.active { display: flex; animation: fadein .35s ease; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(12px);} to { opacity: 1; transform: none;} }
+  h1 { font-size: 3.2em; color: var(--accent); margin-bottom: .3em; line-height: 1.15; }
+  h2 { font-size: 2.2em; color: var(--accent); margin-bottom: .7em; border-bottom: 2px solid #2b3540; padding-bottom: .3em;}
+  h3 { color: var(--accent2); margin: .8em 0 .3em; font-size: 1.15em; }
+  p, li { font-size: 1.25em; line-height: 1.55; color: var(--text); }
+  ul { margin-left: 1.2em; margin-top: .4em; }
+  li { margin-bottom: .45em; }
+  .sub { color: var(--dim); font-size: 1.4em; }
+  .cols { display: flex; gap: 3em; margin-top: .5em; }
+  .cols > div { flex: 1; }
+  .card { background: var(--card); border-radius: 12px; padding: 1.1em 1.4em; margin: .5em 0; border-left: 4px solid var(--accent); }
+  .card.orange { border-left-color: var(--accent2); }
+  .card.green { border-left-color: var(--green); }
+  .card.red { border-left-color: var(--red); }
+  .kbd { background:#2b3540; border-radius:5px; padding:.1em .5em; font-family: monospace; font-size:.9em; color: var(--accent2); }
+  .big-num { font-size: 3em; color: var(--accent); font-weight: 700; }
+  .stat { text-align: center; background: var(--card); border-radius: 12px; padding: 1em; flex: 1; }
+  .stat .lbl { color: var(--dim); font-size: 1em; margin-top: .3em; }
+  .footer { position: fixed; bottom: 14px; right: 24px; color: var(--dim); font-size: .95em; }
+  .progress { position: fixed; bottom: 0; left: 0; height: 4px; background: var(--accent); transition: width .3s; }
+  table { border-collapse: collapse; margin-top: .6em; width: 100%; }
+  th, td { padding: .45em .9em; text-align: left; border-bottom: 1px solid #2b3540; font-size: 1.05em; }
+  th { color: var(--accent2); }
+  code { font-family: monospace; color: var(--green); font-size: .95em; }
+  .center { text-align: center; }
+  .pipeline { display:flex; align-items:center; gap:.6em; flex-wrap:wrap; margin-top:1em;}
+  .pipe-box { background:var(--card); border:1px solid #2b3540; border-radius:10px; padding:.7em 1em; font-size:1.05em;}
+  .pipe-arrow { color:var(--accent); font-size:1.5em; }
+</style>
+</head>
+<body>
+
+<!-- 1 ΤΙΤΛΟΣ -->
+<section class="slide active">
+  <p class="sub">Υπολογιστική Γεωμετρία — Τελική Εργασία</p>
+  <h1>Ψηφιακό Δίδυμο Πόλης<br><span style="font-size:.55em;color:var(--dim)">Διαδραστική 3D προσομοίωση αστικής κυκλοφορίας από πραγματικά δεδομένα</span></h1>
+  <div class="cols" style="margin-top:2em">
+    <div class="stat"><div class="big-num">~30</div><div class="lbl">Python modules</div></div>
+    <div class="stat"><div class="big-num">54</div><div class="lbl">αυτόματα tests</div></div>
+    <div class="stat"><div class="big-num">5+</div><div class="lbl">είδη «κατοίκων»</div></div>
+    <div class="stat"><div class="big-num">2</div><div class="lbl">μηχανές κυκλοφορίας</div></div>
+  </div>
+</section>
+
+<!-- 2 Η ΙΔΕΑ -->
+<section class="slide">
+  <h2>Η ιδέα — τι είναι «ψηφιακό δίδυμο»</h2>
+  <div class="card"><p>Δίνεις μια <b>διεύθυνση</b> και μια <b>ακτίνα</b> → το πρόγραμμα κατεβάζει τα πραγματικά κτήρια, δρόμους και ανάγλυφο, και χτίζει μια <b>ζωντανή 3D πόλη</b> με αυτοκίνητα, πεζούς, ποδηλάτες, λεωφορεία και φανάρια.</p></div>
+  <div class="card orange"><p>Δεν είναι απλώς οπτικοποίηση: είναι <b>εργαλείο σχεδιασμού</b>. Αλλάζεις την πόλη (φανάρια, κυκλικοί κόμβοι, γέφυρες, κτήρια) και <b>μετράς</b> τι συμβαίνει — χρόνοι διαδρομής, ρύποι, θόρυβος, ακόμα και τραυματισμοί πεζών.</p></div>
+  <p style="margin-top:1em"><code>python main_ast6.py --address "Patras, Greece" --radius 300</code></p>
+</section>
+
+<!-- 3 PIPELINE ΔΕΔΟΜΕΝΩΝ -->
+<section class="slide">
+  <h2>Από τα δεδομένα στην πόλη</h2>
+  <div class="pipeline">
+    <div class="pipe-box">Overture Maps / OSM<br><span style="color:var(--dim)">κτήρια, δρόμοι, POIs, νερό</span></div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-box">Copernicus DEM<br><span style="color:var(--dim)">υψομετρικό ανάγλυφο 30 m</span></div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-box">Γεωμετρική επεξεργασία<br><span style="color:var(--dim)">extrusion, προβολές, γράφος</span></div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-box">3D σκηνή (PyVista/VTK)</div>
+  </div>
+  <h3>Υπολογιστική γεωμετρία στην πράξη</h3>
+  <ul>
+    <li>Κάτοψεις κτηρίων → <b>εξώθηση (extrusion)</b> σε 3D με πραγματικά ύψη</li>
+    <li>Οδικό δίκτυο → <b>κατευθυνόμενος γράφος</b> (NetworkX) με μονοδρομήσεις και turn restrictions</li>
+    <li><b>Octree</b> για επιτάχυνση ray-casting σκιών, <b>KD-trees</b> για χωρικά ερωτήματα</li>
+    <li>Draping όλης της πόλης πάνω στο DEM — δρόμοι και agents ακολουθούν το ανάγλυφο</li>
+  </ul>
+</section>
+
+<!-- 4 ΚΥΚΛΟΦΟΡΙΑ IDM -->
+<section class="slide">
+  <h2>Προσομοίωση κυκλοφορίας — Intelligent Driver Model</h2>
+  <div class="cols">
+    <div>
+      <ul>
+        <li>Κάθε αυτοκίνητο έχει <b>φυσική</b>: επιτάχυνση, απόσταση ασφαλείας, φρενάρισμα πριν από στροφές (όριο ταχύτητας ανά γωνία στροφής)</li>
+        <li><b>Ετερογένεια οδηγών</b>: κάθε οδηγός με δικά του T/a/b από κανονικές κατανομές</li>
+        <li><b>Αλλαγή λωρίδας</b> όταν η μπροστινή είναι αργή</li>
+        <li>Φανάρια = «φαντάσματα-εμπόδια» στη γραμμή στάσης· κυκλικοί κόμβοι με προτεραιότητα δακτυλίου</li>
+        <li>Ώρες αιχμής: η ζήτηση ακολουθεί ημερήσια καμπύλη (πρωί 1.4×, νύχτα 0.6×)</li>
+      </ul>
+    </div>
+    <div>
+      <div class="card green"><p><b>Όλα διανυσματοποιημένα σε NumPy</b> — καμία Python loop στο hot path. Εκατοντάδες οχήματα σε 60 fps.</p></div>
+      <div class="card"><p>Ζήτηση από <b>βαρυτικό μοντέλο O-D</b>: τα ταξίδια πηγαίνουν από/προς πραγματικές συστάδες POIs, ανάλογα με την ώρα.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 5 ΟΙ ΚΑΤΟΙΚΟΙ -->
+<section class="slide">
+  <h2>Οι «κάτοικοι» της πόλης</h2>
+  <table>
+    <tr><th>Agent</th><th>Συμπεριφορά</th></tr>
+    <tr><td>🚗 Αυτοκίνητα</td><td>IDM φυσική, 3D μοντέλα, παρκάρουν/ξεκινούν σε πραγματικά parking</td></tr>
+    <tr><td>🚶 Πεζοί</td><td>Περπατούν στα πεζοδρόμια, <b>διασχίζουν δρόμους</b> (με παύση στο κράσπεδο), τα αυτοκίνητα τους παραχωρούν</td></tr>
+    <tr><td>🚴 Ποδηλάτες</td><td>Κινούνται σε ποδηλατόδρομους και ήπιους δρόμους</td></tr>
+    <tr><td>🚌 Λεωφορεία</td><td>Πραγματικές γραμμές από <b>GTFS</b> + ζωντανές θέσεις από GTFS-Realtime feed</td></tr>
+    <tr><td>🚑 Ασθενοφόρα</td><td>Περνούν κόκκινα (σειρήνα), η κυκλοφορία ανοίγει δρόμο — αλλά ποτέ από πεζόδρομους</td></tr>
+  </table>
+  <div class="card orange" style="margin-top:.8em"><p>Μπορείς να <b>μπεις μέσα στην πόλη</b>: κλικ σε πεζό → τον ελέγχεις σε πρώτο πρόσωπο με βελάκια και ποντίκι (πλήκτρο <span class="kbd">f</span> για ελεύθερο περπάτημα).</p></div>
+</section>
+
+<!-- 6 EDITOR -->
+<section class="slide">
+  <h2>Ο επεξεργαστής πόλης — «τι θα γινόταν αν…»</h2>
+  <div class="cols">
+    <div>
+      <ul>
+        <li><span class="kbd">2</span> Αντιστροφή μονοδρόμων</li>
+        <li><span class="kbd">3</span> Κυκλικοί κόμβοι (αντικαθιστούν διασταύρωση με γεωμετρία δακτυλίου)</li>
+        <li><span class="kbd">4</span>/<span class="kbd">5</span> Φανάρια / STOP</li>
+        <li><span class="kbd">6</span> Φωτισμός δρόμων</li>
+        <li><span class="kbd">g</span> Νέα κτήρια (ρίχνουν σκιές αμέσως)</li>
+        <li><span class="kbd">y</span> <b>Υπερυψωμένες γέφυρες-λεωφόροι</b></li>
+        <li><span class="kbd">o</span> Undo (10 επίπεδα)</li>
+      </ul>
+    </div>
+    <div>
+      <div class="card"><p><b>Η γέφυρα είναι γεωμετρικό πρόβλημα:</b> προβάλλει τα κτήρια στον άξονα της γέφυρας, βρίσκει το μέγιστο ύψος στον διάδρομο και υψώνει το κατάστρωμα ώστε να τα <b>υπερπηδά αυτόματα</b>, με ράμπες και πυλώνες.</p></div>
+      <div class="card green"><p>Κάθε αλλαγή <b>ξαναχτίζει τον γράφο</b> — τα αυτοκίνητα και ο δρομολογητής βλέπουν αμέσως τη νέα υποδομή.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 7 ΗΛΙΟΣ & ΕΝΕΡΓΕΙΑ -->
+<section class="slide">
+  <h2>Ήλιος, σκιές & ενεργειακή δρομολόγηση</h2>
+  <div class="cols">
+    <div>
+      <h3>Σκιές</h3>
+      <ul>
+        <li>Ray-casting με <b>Numba JIT</b> + octree — σκιά κάθε κτηρίου σε κάθε σημείο του εδάφους</li>
+        <li>Κύκλος ημέρας (<span class="kbd">t</span>): ο ήλιος κινείται, οι σκιές επανυπολογίζονται, τα παράθυρα ανάβουν το βράδυ</li>
+      </ul>
+      <h3>Φωτισμός δρόμων</h3>
+      <ul><li><b>Γενετικός αλγόριθμος</b> τοποθετεί κολώνες για μέγιστη κάλυψη με ελάχιστη επικάλυψη</li></ul>
+    </div>
+    <div>
+      <h3>Ηλιακά οχήματα — 3 βέλτιστες διαδρομές</h3>
+      <div class="card green"><p><b>Πράσινη</b>: ελάχιστη ενέργεια (προτιμά ηλιόλουστους δρόμους — φυσική panel + αεροδυναμική)</p></div>
+      <div class="card orange"><p><b>Πορτοκαλί</b>: συνδυασμός χρόνου/ενέργειας (Pareto)</p></div>
+      <div class="card"><p><b>Λευκή</b>: συντομότερη — Εύρημα: η ενεργειακή διαδρομή <b>αποφεύγει</b> τη λεωφόρο, γιατί η αντίσταση αέρα ∝ v²!</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 8 ΑΝΑΛΥΤΙΚΑ ΕΠΙΠΕΔΑ -->
+<section class="slide">
+  <h2>Αναλυτικά επίπεδα — η πόλη ως δεδομένα</h2>
+  <table>
+    <tr><th>Επίπεδο</th><th>Πλήκτρο</th><th>Μοντέλο</th></tr>
+    <tr><td>Πυκνότητα κυκλοφορίας</td><td><span class="kbd">h</span></td><td>Κυλιόμενο ιστόγραμμα θέσεων + Gaussian blur</td></tr>
+    <tr><td>Θόρυβος</td><td><span class="kbd">n</span></td><td>CNOSSOS-EU: 85 dB(A)/όχημα, σφαιρική εξασθένηση, <b>ενεργειακή άθροιση</b> πολλών πηγών, μετρητής παραβιάσεων 65 dB</td></tr>
+    <tr><td>Ποιότητα αέρα (NOx/CO₂/PM)</td><td>panel</td><td>Συντελεστές εκπομπών ΕΕΑ ανά ταχύτητα + Gaussian διασπορά</td></tr>
+    <tr><td>Κεντρικότητα δικτύου</td><td><span class="kbd">v</span></td><td>Edge betweenness — ποιοι δρόμοι είναι η «ραχοκοκαλιά»</td></tr>
+    <tr><td>Συμφόρηση (SUMO)</td><td><span class="kbd">u</span></td><td>Ζωντανός λόγος ταχύτητας/ορίου ανά δρόμο</td></tr>
+  </table>
+</section>
+
+<!-- 9 SUMO & ΕΓΚΥΡΟΤΗΤΑ -->
+<section class="slide">
+  <h2>Δεύτερη μηχανή & επιστημονική εγκυρότητα</h2>
+  <div class="cols">
+    <div>
+      <h3>SUMO co-simulation</h3>
+      <ul>
+        <li><code>--engine sumo</code>: το κορυφαίο ερευνητικό εργαλείο προσομοίωσης οδηγεί τα οχήματα μέσω TraCI, εμείς κάνουμε το 3D rendering</li>
+        <li>Η SUMO σκηνή χτίζεται <b>αυτόματα</b> από τη διεύθυνση (netconvert)</li>
+        <li>Σενάρια βλαβών (<span class="kbd">i</span>): όχημα «χαλάει» και βλέπεις το μποτιλιάρισμα να εξαπλώνεται</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Validation — δεν το παίρνουμε ως δεδομένο</h3>
+      <div class="card green"><p>Χρόνοι διαδρομής συγκρίνονται με <b>OSRM</b> (πραγματικός δρομολογητής) σε τυχαία ζεύγη O-D: MAPE, RMSE, GEH</p></div>
+      <div class="card"><p>Σύγκριση IDM ↔ SUMO στα ίδια ζεύγη — οι δύο μηχανές συμφωνούν</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 9b ΠΟΣΟΤΙΚΕΣ ΜΕΛΕΤΕΣ -->
+<section class="slide">
+  <h2>Ποσοτικές μελέτες — αριθμοί, όχι εντυπώσεις</h2>
+  <p class="sub" style="font-size:1.1em;margin-bottom:.6em">Κάθε υποσύστημα απαντά σε ένα πραγματικό ερώτημα, με αυτόματο headless πείραμα:</p>
+  <div class="cols">
+    <div>
+      <h3>☀️ «Αξίζουν τα ηλιακά αυτοκίνητα;»</h3>
+      <table>
+        <tr><th>ώρα</th><th>εξοικονόμηση</th></tr>
+        <tr><td>06:00</td><td>0.3%</td></tr>
+        <tr><td>09:00</td><td>3.0%</td></tr>
+        <tr><td><b>12:00</b></td><td><b style="color:var(--green)">4.5%</b></td></tr>
+        <tr><td>15:00</td><td>3.6%</td></tr>
+        <tr><td>21:00</td><td>0.0%</td></tr>
+      </table>
+      <p style="font-size:1em;margin-top:.4em;color:var(--dim)">~1.8% ημερησίως — μικρό αλλά πραγματικό: 350 W οροφή vs ~1.5 kW κατανάλωση. Μηδέν τη νύχτα, μηδέν στη σκιά — η φυσική είναι έντιμη.</p>
+    </div>
+    <div>
+      <h3>💡 «Πόσο φως αγοράζει κάθε κολώνα;»</h3>
+      <table>
+        <tr><th>κολώνες</th><th>κάλυψη</th><th>κέρδος/κολώνα</th></tr>
+        <tr><td>2</td><td>23%</td><td>+11.5%</td></tr>
+        <tr><td>4</td><td>45%</td><td>+11.0%</td></tr>
+        <tr><td>6</td><td>58%</td><td>+6.2%</td></tr>
+        <tr><td>8</td><td>62%</td><td>+2.2%</td></tr>
+        <tr><td>12</td><td>66%</td><td>+1.0%</td></tr>
+      </table>
+      <p style="font-size:1em;margin-top:.4em;color:var(--dim)">Φθίνουσες αποδόσεις: οι πρώτες κολώνες αγοράζουν <b>11×</b> περισσότερη κάλυψη από τις τελευταίες.</p>
+    </div>
+    <div>
+      <h3>🚗 «Τι κοστίζει το μποτιλιάρισμα;»</h3>
+      <table>
+        <tr><th>οχήματα</th><th>ταχύτητα</th><th>CO₂ g/km</th><th>θόρυβος*</th></tr>
+        <tr><td>15</td><td>30.0 km/h</td><td>302</td><td>22</td></tr>
+        <tr><td>40</td><td>17.7 km/h</td><td>814</td><td>59</td></tr>
+        <tr><td>90</td><td>9.5 km/h</td><td style="color:var(--red)">1391</td><td>72</td></tr>
+      </table>
+      <p style="font-size:1em;margin-top:.4em;color:var(--dim)">*κελιά ≥65 dB. 6× οχήματα → ταχύτητα ÷3.2, CO₂/km <b>×4.6</b>: η συμφόρηση ρυπαίνει υπεργραμμικά.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 10 ΑΣΦΑΛΕΙΑ ΠΕΖΩΝ -->
+<section class="slide">
+  <h2>Μελέτη ασφάλειας πεζών</h2>
+  <div class="card red"><p>Οι πεζοί διασχίζουν δρόμους. Αν όχημα με ταχύτητα &gt; 2 m/s βρεθεί σε ακτίνα 1.4 m → <b>τραυματισμός</b> (σοβαρός αν ≥ 30 km/h). Ο πεζός πέφτει στο έδαφος, μετρητής στην οθόνη.</p></div>
+  <h3>Το ερώτημα του πολεοδόμου: «Τι θα γινόταν αν έσβηνα τα φανάρια;»</h3>
+  <p>Η ίδια προσομοίωση τρέχει <b>headless</b> (χωρίς γραφικά) με διαφορετικά presets:</p>
+  <table>
+    <tr><th>Preset</th><th>Φανάρια</th><th>Τραυματισμοί (60 s)</th><th>Σοβαροί</th></tr>
+    <tr><td>Με φανάρια</td><td>10</td><td style="color:var(--green)">6</td><td>5</td></tr>
+    <tr><td>Χωρίς φανάρια</td><td>0</td><td style="color:var(--red)">7</td><td>5</td></tr>
+  </table>
+  <p style="margin-top:.6em"><code>python tools/run_safety_study.py --address "Patras, Greece" --duration 300 --calm</code></p>
+</section>
+
+<!-- 11 ΣΕΝΑΡΙΑ A/B -->
+<section class="slide">
+  <h2>Σύγκριση σεναρίων A/B — εργαλείο απόφασης</h2>
+  <div class="pipeline">
+    <div class="pipe-box"><span class="kbd">7</span> Αποθήκευση σεναρίου A</div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-box">αλλαγές στην πόλη<br><span style="color:var(--dim)">γέφυρα, φανάρια, μονοδρομήσεις…</span></div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-box"><span class="kbd">8</span> Αποθήκευση B</div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-box"><span class="kbd">9</span> Headless εκτέλεση και των δύο</div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-box"><span class="kbd">0</span> Χάρτης διαφορών</div>
+  </div>
+  <ul style="margin-top:1.2em">
+    <li><b>Μπλε</b> δρόμοι = βελτιώθηκαν, <b>κόκκινοι</b> = χειροτέρεψαν</li>
+    <li>Πίνακας: Δ χρόνου διαδρομής, Δ εκπομπών, Δ θορύβου</li>
+    <li>Ίδιο seed και στα δύο σενάρια → δίκαιη σύγκριση</li>
+  </ul>
+</section>
+
+<!-- 12 ΜΗΧΑΝΙΚΗ -->
+<section class="slide">
+  <h2>Μηχανική λογισμικού</h2>
+  <div class="cols">
+    <div>
+      <h3>Αρχιτεκτονική</h3>
+      <ul>
+        <li><b>16 mixin κλάσεις</b> συνθέτουν την <code>DigitalTwinApp</code> — κάθε υποσύστημα ανεξάρτητο αρχείο</li>
+        <li>Φυσική 20 Hz αποσυζευγμένη από rendering (interpolation)</li>
+        <li>Cache σε όλα: OSM, DEM, σκιές, SUMO σκηνές</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Ποιότητα</h3>
+      <ul>
+        <li><b>54 αυτόματα tests</b> — τρέχουν headless σε ~30 s, σε κάθε commit (pre-commit hook)</li>
+        <li>Επιδιόρθωση δύσκολων bugs: segfault VTK σε macOS M1, clipping planes, key-binding συγκρούσεις της pyvista</li>
+        <li>Profiler mode με ανά-καρέ ανάλυση χρόνου</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card" style="margin-top:.6em"><p class="center" style="font-size:1.1em"><code>python tests/run_tests.py</code> → <b style="color:var(--green)">54/54 passed</b></p></div>
+</section>
+
+<!-- 13 DEMO -->
+<section class="slide">
+  <h2>Ζωντανή επίδειξη — ροή</h2>
+  <ol style="font-size:1.25em; line-height:1.9; margin-left:1.2em">
+    <li>Εκκίνηση στην Πάτρα — η πόλη «αναπνέει»: αυτοκίνητα, πεζοί, φανάρια</li>
+    <li><span class="kbd">t</span> Κύκλος ημέρας: ήλιος, σκιές, νυχτερινός φωτισμός</li>
+    <li>Κλικ σε πεζό → πρώτο πρόσωπο μέσα στην πόλη</li>
+    <li><span class="kbd">y</span> Χτίζω γέφυρα πάνω από κτήρια → κλικ σε αμάξι → παίρνει τη νέα λεωφόρο</li>
+    <li><span class="kbd">n</span> Θόρυβος και <span class="kbd">v</span> κεντρικότητα — πού «πονάει» το δίκτυο</li>
+    <li><span class="kbd">m</span> Ασθενοφόρο — η κυκλοφορία ανοίγει</li>
+    <li>Τερματικό: μελέτη ασφάλειας με/χωρίς φανάρια</li>
+  </ol>
+</section>
+
+<!-- 14 ΚΛΕΙΣΙΜΟ -->
+<section class="slide">
+  <h2>Συμπεράσματα</h2>
+  <div class="card"><p>Από <b>ανοιχτά γεωχωρικά δεδομένα</b> σε <b>ζωντανό, μετρήσιμο ψηφιακό δίδυμο</b> — με τη γεωμετρία παντού: extrusion, γράφοι, octrees, ray-casting, προβολές, τομές ευθυγράμμων τμημάτων.</p></div>
+  <div class="card green"><p>Όχι μόνο προσομοίωση αλλά <b>εργαλείο απόφασης</b>: σενάρια A/B, μελέτες ασφάλειας, ενεργειακή δρομολόγηση, validation με πραγματικά δεδομένα.</p></div>
+  <div class="card orange"><p>Επόμενα βήματα: περισσότερες πόλεις, βαθμονόμηση με πραγματικές μετρήσεις κυκλοφορίας, machine learning για πρόβλεψη ζήτησης.</p></div>
+  <h1 style="margin-top:.6em; font-size:2.2em" class="center">Ευχαριστώ! — Ερωτήσεις;</h1>
+</section>
+
+<div class="footer"><span id="pg"></span> — βελάκια / κλικ για πλοήγηση</div>
+<div class="progress" id="bar"></div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  let cur = 0;
+  function show(i) {
+    cur = Math.max(0, Math.min(slides.length - 1, i));
+    slides.forEach((s, k) => s.classList.toggle('active', k === cur));
+    document.getElementById('pg').textContent = (cur + 1) + ' / ' + slides.length;
+    document.getElementById('bar').style.width = ((cur + 1) / slides.length * 100) + '%';
+  }
+  document.addEventListener('keydown', e => {
+    if (['ArrowRight','ArrowDown',' ','PageDown'].includes(e.key)) show(cur + 1);
+    if (['ArrowLeft','ArrowUp','PageUp'].includes(e.key)) show(cur - 1);
+    if (e.key === 'Home') show(0);
+    if (e.key === 'End') show(slides.length - 1);
+  });
+  document.addEventListener('click', e => {
+    if (e.clientX > window.innerWidth / 2) show(cur + 1); else show(cur - 1);
+  });
+  show(0);
+</script>
+</body>
+</html>

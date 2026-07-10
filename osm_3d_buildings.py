@@ -20,7 +20,30 @@ from turn_restrictions import load_osm_direction_graph_cached, resolve_osm_road_
 LEVEL_HEIGHT_M = 3.0
 PARAPET_INSET_M = 0.35
 PARAPET_HEIGHT_M = 1.0
-CAR_HIGHWAY_TAGS = {"primary", "secondary", "residential", "unclassified"}
+CAR_HIGHWAY_TAGS = {"primary", "secondary", "residential", "unclassified",
+                    "tertiary", "tertiary_link", "primary_link", "secondary_link",
+                    "trunk", "trunk_link", "motorway_link", "living_street", "road"}
+
+# Half-width buffer (metres) per highway type used for the road surface polygon.
+# Each type is buffered separately and then union-ed so wide primary roads don't
+# artificially widen adjacent narrow residential streets.
+HIGHWAY_ROAD_WIDTHS: dict[str, float] = {
+    "motorway":       7.0,
+    "motorway_link":  5.5,
+    "trunk":          6.5,
+    "trunk_link":     5.0,
+    "primary":        5.5,
+    "primary_link":   4.5,
+    "secondary":      5.0,
+    "secondary_link": 4.0,
+    "tertiary":       4.5,
+    "tertiary_link":  3.5,
+    "residential":    4.0,
+    "living_street":  3.0,
+    "unclassified":   4.0,
+    "road":           3.5,
+    "service":        2.5,
+}
 PEDESTRIAN_HIGHWAY_TAGS = {"footway", "pedestrian", "path", "cycleway"}
 MAX_SEGMENT_BUFFER_AREA_M2 = 3000.0
 SEGMENT_AREA_EXPANSION_FACTOR = 8.0
@@ -381,13 +404,18 @@ def _apply_surface_color(mesh: pv.PolyData, rgb: np.ndarray) -> pv.PolyData:
 
 def build_road_and_sidewalk_meshes_from_graph(
     projected_graph: nx.MultiDiGraph,
-    road_buffer_m: float = 3.0,
-    sidewalk_buffer_m: float = 1.5,
+    road_buffer_m: float = 4.5,
+    sidewalk_buffer_m: float = 2.0,
     road_extrude_z: float = 0.1,
     sidewalk_extrude_z: float = 0.15,
     max_segment_area_m2: float = MAX_SEGMENT_BUFFER_AREA_M2,
 ) -> tuple[pv.PolyData, pv.PolyData]:
-    """Build car/pedestrian surface meshes from street centerlines using buffered segments."""
+    """Build car/pedestrian surface meshes from street centerlines using buffered segments.
+
+    Each highway type is buffered with its own width from HIGHWAY_ROAD_WIDTHS so
+    primary arteries don't widen adjacent residential streets.  road_buffer_m is
+    used as the fallback for any type not listed in that dict.
+    """
     if road_buffer_m <= 0.0:
         raise ValueError("road_buffer_m must be > 0.")
     if sidewalk_buffer_m <= 0.0:
@@ -404,12 +432,24 @@ def build_road_and_sidewalk_meshes_from_graph(
     if edges_gdf.empty:
         return pv.PolyData(), pv.PolyData()
 
-    car_roads_polygon = _buffer_edges_by_highway_class(
-        edges_gdf=edges_gdf,
-        allowed_tags=CAR_HIGHWAY_TAGS,
-        buffer_m=float(road_buffer_m),
-        max_segment_area_m2=float(max_segment_area_m2),
-    )
+    # Per-type road buffering: buffer each highway class separately then union.
+    road_parts: list = []
+    for hw_tag in CAR_HIGHWAY_TAGS:
+        w = HIGHWAY_ROAD_WIDTHS.get(hw_tag, road_buffer_m)
+        part = _buffer_edges_by_highway_class(
+            edges_gdf=edges_gdf,
+            allowed_tags={hw_tag},
+            buffer_m=float(w),
+            max_segment_area_m2=float(max_segment_area_m2),
+        )
+        if part is not None and not part.is_empty:
+            road_parts.append(part)
+
+    if road_parts:
+        car_roads_polygon = unary_union(road_parts)
+    else:
+        car_roads_polygon = Polygon()
+
     pedestrian_roads_polygon = _buffer_edges_by_highway_class(
         edges_gdf=edges_gdf,
         allowed_tags=PEDESTRIAN_HIGHWAY_TAGS,
@@ -425,6 +465,366 @@ def build_road_and_sidewalk_meshes_from_graph(
     return road_mesh, sidewalk_mesh
 
 
+def _fetch_ms_building_heights(center_lat: float, center_lon: float, radius_m: float, proj_str: str):
+    """Fetch Microsoft Building Footprints heights from Planetary Computer.
+
+    Returns (centroids_xy, heights, kdtree) in local proj_str CRS, or (None, None, None) on failure.
+    """
+    try:
+        import pystac_client
+        import planetary_computer
+    except ImportError:
+        return None, None, None
+
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return None, None, None
+
+    try:
+        # Build WGS84 bounding box
+        deg_per_m = radius_m / 111_320.0
+        lon_pad = deg_per_m / max(0.01, abs(np.cos(np.radians(center_lat))))
+        lat_pad = deg_per_m
+        _bbox = [center_lon - lon_pad, center_lat - lat_pad,
+                 center_lon + lon_pad, center_lat + lat_pad]
+
+        catalog = pystac_client.Client.open(
+            "https://planetarycomputer.microsoft.com/api/stac/v1",
+            modifier=planetary_computer.sign_inplace,
+        )
+        search = catalog.search(
+            collections=["ms-buildings"],
+            bbox=_bbox,
+            max_items=4,
+        )
+        items = list(search.items())
+        if not items:
+            return None, None, None
+
+        frames = []
+        for item in items:
+            asset = item.assets.get("data")
+            if asset is None:
+                continue
+            signed_href = planetary_computer.sign(asset).href
+            try:
+                gdf = gpd.read_parquet(signed_href, columns=["geometry", "height"])
+                frames.append(gdf)
+            except Exception:
+                continue
+
+        if not frames:
+            return None, None, None
+
+        import pandas as _pd
+        combined = _pd.concat(frames, ignore_index=True)
+        combined = combined[combined["height"].notna() & (combined["height"] > 0.0)]
+        if combined.empty:
+            return None, None, None
+
+        # Project to local CRS
+        combined = combined.set_crs("EPSG:4326", allow_override=True).to_crs(proj_str)
+        centroids = np.array([[g.centroid.x, g.centroid.y] for g in combined.geometry])
+        heights = combined["height"].to_numpy(dtype=float)
+
+        # Filter non-finite
+        valid = np.isfinite(centroids).all(axis=1) & np.isfinite(heights)
+        centroids, heights = centroids[valid], heights[valid]
+        if len(centroids) == 0:
+            return None, None, None
+
+        tree = cKDTree(centroids)
+        print(f"[ms-buildings] {len(centroids)} footprints with height data loaded")
+        return centroids, heights, tree
+
+    except Exception as _e:
+        print(f"[ms-buildings] skipped: {_e}")
+        return None, None, None
+
+
+def _fetch_dem_sampler(center_lat: float, center_lon: float, radius_m: float, proj_str: str):
+    """Fetch Copernicus DEM GLO-30 and return a terrain elevation sampler.
+
+    Returns callable sampler(xy: np.ndarray (N,2)) → elevations (N,) metres
+    in the local proj_str CRS, or None on failure / missing dependencies.
+    """
+    try:
+        import pystac_client
+        import planetary_computer
+    except ImportError:
+        return None
+    try:
+        import rasterio
+        from rasterio.merge import merge as _rio_merge
+    except ImportError:
+        return None
+    try:
+        from pyproj import Transformer
+        from scipy.interpolate import RegularGridInterpolator
+    except ImportError:
+        return None
+
+    # ── Disk cache: the merged elevation grid is ~50 MB of remote GeoTIFF
+    # reads via STAC — cache it as .npz so later runs skip the network.
+    from pathlib import Path as _Path
+    _dem_cache_dir = _Path(__file__).resolve().parent / "cache"
+    _dem_cache = _dem_cache_dir / (
+        f"dem_{center_lat:.5f}_{center_lon:.5f}_{radius_m:.0f}.npz")
+
+    def _sampler_from_grid(ys, xs, elev):
+        from scipy.interpolate import RegularGridInterpolator as _RGI
+        from pyproj import Transformer as _Tr
+        interp = _RGI((ys, xs), elev, method="linear",
+                      bounds_error=False, fill_value=0.0)
+        _tr = _Tr.from_crs(proj_str, "EPSG:4326", always_xy=True)
+
+        def _sampler(xy_local: np.ndarray) -> np.ndarray:
+            lons, lats = _tr.transform(xy_local[:, 0], xy_local[:, 1])
+            return interp(np.column_stack([lats, lons]))
+        return _sampler
+
+    if _dem_cache.exists():
+        try:
+            _z = np.load(_dem_cache)
+            print(f"[dem] loaded cache {_dem_cache.name} "
+                  f"({_z['elev'].shape[0]}×{_z['elev'].shape[1]} cells)")
+            return _sampler_from_grid(_z["ys"], _z["xs"], _z["elev"])
+        except Exception as _ce:
+            print(f"[dem] cache read failed ({_ce}) — re-fetching")
+
+    try:
+        deg_per_m = radius_m / 111_320.0
+        lon_pad = deg_per_m / max(0.01, abs(np.cos(np.radians(center_lat))))
+        lat_pad = deg_per_m
+        bbox_wgs84 = [
+            center_lon - lon_pad, center_lat - lat_pad,
+            center_lon + lon_pad, center_lat + lat_pad,
+        ]
+
+        catalog = pystac_client.Client.open(
+            "https://planetarycomputer.microsoft.com/api/stac/v1",
+            modifier=planetary_computer.sign_inplace,
+        )
+        search = catalog.search(
+            collections=["cop-dem-glo-30"],
+            bbox=bbox_wgs84,
+            max_items=4,
+        )
+        items = list(search.items())
+        if not items:
+            return None
+
+        datasets = []
+        for item in items:
+            asset = item.assets.get("data")
+            if asset is None:
+                continue
+            signed_href = planetary_computer.sign(asset).href
+            try:
+                datasets.append(rasterio.open(signed_href))
+            except Exception:
+                continue
+
+        if not datasets:
+            return None
+
+        if len(datasets) == 1:
+            elev = datasets[0].read(1).astype(float)
+            transform = datasets[0].transform
+        else:
+            merged, transform = _rio_merge(datasets)
+            elev = merged[0].astype(float)
+
+        for ds in datasets:
+            ds.close()
+
+        nrows, ncols = elev.shape
+        # Cell-centre coordinates in WGS84 (lon = x-axis, lat = y-axis)
+        xs = transform.c + (np.arange(ncols) + 0.5) * transform.a   # longitudes, E-increasing
+        ys = transform.f + (np.arange(nrows) + 0.5) * transform.e   # latitudes, N-to-S (decreasing)
+
+        elev[elev < -500] = 0.0  # nodata / ocean → sea level
+
+        # RegularGridInterpolator requires monotonically increasing axes — flip north-up rasters
+        if ys[0] > ys[-1]:
+            ys = ys[::-1]
+            elev = elev[::-1, :]
+
+        try:
+            _dem_cache_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(_dem_cache, ys=ys, xs=xs, elev=elev)
+            print(f"[dem] saved cache {_dem_cache.name}")
+        except Exception as _se:
+            print(f"[dem] cache save failed: {_se}")
+
+        print(f"[dem] Copernicus DEM GLO-30: {nrows}×{ncols} cells, {len(items)} tile(s)")
+        return _sampler_from_grid(ys, xs, elev)
+
+    except Exception as _e:
+        print(f"[dem] skipped: {_e}")
+        return None
+
+
+def _fetch_land_fill_mesh(
+    center: tuple,
+    radius: float,
+    proj_str: str,
+) -> "pv.PolyData | None":
+    """Fetch OSM land-use / natural polygons and build a flat coloured fill mesh.
+
+    The mesh lives at Z = 0.02 m — above the base ground plane (Z = -0.10) but
+    below road surfaces (Z = 0.10).  Per-cell 'RGB' scalars are attached so one
+    add_mesh(scalars='RGB', rgb=True) call renders all categories at once.
+    Returns None on any failure; never raises.
+    """
+    FILL_Z = 0.02
+
+    def _hex(h: str) -> np.ndarray:
+        h = h.lstrip("#")
+        return np.array([int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)], dtype=np.uint8)
+
+    _COLOUR: dict[str, np.ndarray] = {
+        # ── water bodies ─────────────────────────────────────────────
+        "water":             _hex("#2e6ea6"),   # deep sea blue
+        "bay":               _hex("#2e6ea6"),
+        "strait":            _hex("#2e6ea6"),
+        "river":             _hex("#3578b0"),
+        "reservoir":         _hex("#3578b0"),
+        "lake":              _hex("#3578b0"),
+        "pond":              _hex("#3578b0"),
+        "riverbank":         _hex("#3578b0"),
+        "dock":              _hex("#2a5a8a"),
+        "wetland":           _hex("#4a7858"),   # blue-green tint
+        # ── natural / rural ───────────────────────────────────────────
+        "farmland":          _hex("#8a8e6a"),   # muted olive
+        "farmyard":          _hex("#8a8e6a"),
+        "sand":              _hex("#c8c090"),   # pale dune
+        "beach":             _hex("#c8c090"),
+        # ── urban built areas — cool slate palette ────────────────────
+        "residential":       _hex("#474d55"),   # dark cool concrete
+        "commercial":        _hex("#4e545c"),   # slightly lighter
+        "retail":            _hex("#4e545c"),
+        "industrial":        _hex("#373c42"),   # heavier, darker
+        "construction":      _hex("#3e4349"),   # raw concrete
+        "brownfield":        _hex("#3a3f45"),
+        "parking":           _hex("#565b62"),   # light asphalt
+        # ── soft green cover ──────────────────────────────────────────
+        "scrub":             _hex("#5a7850"),   # muted scrub
+        "heath":             _hex("#5a7850"),
+        "grassland":         _hex("#527848"),
+        "grass":             _hex("#3e7838"),
+        "meadow":            _hex("#3e7838"),
+        "recreation_ground": _hex("#3a8040"),
+        "village_green":     _hex("#3a8040"),
+        "allotments":        _hex("#4a7840"),   # slightly darker
+        "cemetery":          _hex("#4a7048"),   # quieter green
+        "garden":            _hex("#3e8038"),
+        "park":              _hex("#367832"),   # vivid park green
+        "pitch":             _hex("#2a7028"),   # sports pitch
+        "playground":        _hex("#3a8040"),
+        "wood":              _hex("#255828"),   # deep forest
+        "forest":            _hex("#255828"),
+    }
+
+    try:
+        gdf = ox.features_from_point(center, tags={
+            "landuse": list({"farmland", "farmyard", "residential", "commercial", "retail",
+                              "industrial", "construction", "brownfield", "grass", "meadow",
+                              "recreation_ground", "village_green", "allotments", "cemetery",
+                              "garden", "forest", "reservoir"}),
+            "natural": list({"grassland", "wetland", "scrub", "heath", "sand", "beach", "wood",
+                              "water", "bay", "strait"}),
+            "waterway": list({"riverbank", "dock"}),
+            "water": list({"river", "lake", "pond", "reservoir"}),
+            "leisure": list({"park", "garden", "recreation_ground", "pitch", "playground"}),
+            "amenity": ["parking"],
+        }, dist=float(radius))
+    except Exception as exc:
+        print(f"[fill] OSM land-use fetch failed: {exc}")
+        return None
+
+    if gdf.empty:
+        print("[fill] no land-use polygons found")
+        return None
+
+    try:
+        proj_gdf = gdf.to_crs(proj_str)
+    except Exception as exc:
+        print(f"[fill] CRS projection failed: {exc}")
+        return None
+
+    from shapely.geometry import Point as _FPt
+    clip_circle = _FPt(0.0, 0.0).buffer(float(radius) * 1.05)
+
+    all_pts:   list[np.ndarray] = []
+    all_faces: list[np.ndarray] = []
+    all_rgb:   list[np.ndarray] = []
+    total_verts = 0
+
+    for _, row in proj_gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        lu  = str(row.get("landuse",   "") or "").lower()
+        nat = str(row.get("natural",   "") or "").lower()
+        lei = str(row.get("leisure",   "") or "").lower()
+        ame = str(row.get("amenity",   "") or "").lower()
+        wwy = str(row.get("waterway",  "") or "").lower()
+        wat = str(row.get("water",     "") or "").lower()
+        cat = lu or nat or lei or ame or wwy or wat
+        rgb = _COLOUR.get(cat)
+        if rgb is None:
+            continue
+
+        try:
+            clipped = geom.intersection(clip_circle)
+        except Exception:
+            clipped = geom
+        if clipped.is_empty:
+            continue
+
+        for poly in _iter_polygon_parts(clipped):
+            if poly.is_empty or poly.exterior is None:
+                continue
+            coords = np.asarray(poly.exterior.coords, dtype=float)
+            if len(coords) < 4:
+                continue
+            if np.allclose(coords[0], coords[-1]):
+                coords = coords[:-1]
+            if len(coords) < 3:
+                continue
+            n = len(coords)
+            pts = np.zeros((n, 3), dtype=float)
+            pts[:, 0] = coords[:, 0]
+            pts[:, 1] = coords[:, 1]
+            pts[:, 2] = FILL_Z
+            face = np.empty(n + 1, dtype=np.int64)
+            face[0] = n
+            face[1:] = np.arange(total_verts, total_verts + n, dtype=np.int64)
+            all_pts.append(pts)
+            all_faces.append(face)
+            all_rgb.append(rgb)
+            total_verts += n
+
+    if not all_pts:
+        print("[fill] no valid polygons after clipping")
+        return None
+
+    try:
+        pts_arr   = np.concatenate(all_pts,   axis=0).astype(float)
+        faces_arr = np.concatenate(all_faces,  axis=0).astype(np.int64)
+        rgb_arr   = np.array(all_rgb, dtype=np.uint8)
+        fill_mesh = pv.PolyData(pts_arr, faces_arr)
+        fill_mesh.cell_data["RGB"] = rgb_arr
+        print(f"[fill] land-use mesh: {fill_mesh.n_cells} polygons, {fill_mesh.n_points} verts")
+        return fill_mesh
+    except Exception as exc:
+        print(f"[fill] mesh construction failed: {exc}")
+        return None
+
+
 def build_3d_city_with_street_surfaces(
     address: str,
     radius: float,
@@ -435,7 +835,7 @@ def build_3d_city_with_street_surfaces(
     sidewalk_extrude_z: float = 0.15,
 ) -> tuple[pv.PolyData, pv.PolyData, pv.PolyData, nx.MultiDiGraph]:
     """Fetch OSM data and return building, road, sidewalk meshes + projected graph."""
-    buildings_mesh, projected_graph, _places, _park_mesh = build_3d_buildings_and_street_graph(
+    buildings_mesh, projected_graph, _places, _park_mesh, _water_mesh = build_3d_buildings_and_street_graph(
         address=address,
         radius=radius,
         extrusion_height=extrusion_height,
@@ -447,6 +847,13 @@ def build_3d_city_with_street_surfaces(
         road_extrude_z=road_extrude_z,
         sidewalk_extrude_z=sidewalk_extrude_z,
     )
+    _dem = projected_graph.graph.get("terrain_sampler")
+    if _dem is not None:
+        for _tm in (road_mesh, sidewalk_mesh, _park_mesh):
+            if _tm is not None and hasattr(_tm, "points") and _tm.n_points > 0:
+                _pts = _tm.points.copy()
+                _pts[:, 2] = _dem(_pts[:, :2]) + _pts[:, 2]
+                _tm.points = _pts
     return buildings_mesh, road_mesh, sidewalk_mesh, projected_graph, _park_mesh
 
 
@@ -457,6 +864,8 @@ def build_3d_buildings_and_street_graph(
     cache_dir=None,
     use_cache: bool = False,
     cache_context_key: str = "",
+    use_dem: bool = True,
+    use_ms_buildings: bool = True,
 ) -> Tuple[pv.PolyData, nx.MultiDiGraph, list]:
     """Fetch OSM buildings and streets around an address and build 3D buildings.
 
@@ -532,6 +941,23 @@ def build_3d_buildings_and_street_graph(
     except Exception:
         projected_parking = gpd.GeoDataFrame()
 
+    # Fetch individual tree nodes and forest areas
+    try:
+        _trees_gdf = ox.features_from_point(center, tags={"natural": "tree"}, dist=radius)
+        proj_trees = _trees_gdf.to_crs(proj_str) if not _trees_gdf.empty else gpd.GeoDataFrame()
+    except Exception:
+        proj_trees = gpd.GeoDataFrame()
+    try:
+        _forests_gdf = ox.features_from_point(center, tags={"landuse": "forest"}, dist=radius)
+        proj_forests = _forests_gdf.to_crs(proj_str) if not _forests_gdf.empty else gpd.GeoDataFrame()
+    except Exception:
+        proj_forests = gpd.GeoDataFrame()
+    try:
+        _cross_gdf = ox.features_from_point(center, tags={"highway": "crossing"}, dist=radius)
+        proj_crossings = _cross_gdf.to_crs(proj_str) if not _cross_gdf.empty else gpd.GeoDataFrame()
+    except Exception:
+        proj_crossings = gpd.GeoDataFrame()
+
     bbox = _radius_to_bbox(float(center[0]), float(center[1]), float(radius))
     osm_direction_graph = load_osm_direction_graph_cached(
         bbox_wsen=bbox,
@@ -577,17 +1003,43 @@ def build_3d_buildings_and_street_graph(
                 data["oneway_legal_forward"] = bool(legal_forward) if legal_forward is not None else True
 
 
+    _ms_centroids, _ms_heights, _ms_tree = (
+        _fetch_ms_building_heights(float(center[0]), float(center[1]), float(radius), proj_str)
+        if use_ms_buildings else (None, None, None)
+    )
+
+    _dem_sampler = (
+        _fetch_dem_sampler(float(center[0]), float(center[1]), float(radius), proj_str)
+        if use_dem else None
+    )
+    if _dem_sampler is not None:
+        projected_graph.graph["terrain_sampler"] = _dem_sampler
+
     extruded_meshes: list[pv.PolyData] = []
     _n_buildings = 0
     res_points = []
     com_points = []
-    
+
     for _, row in projected_buildings.iterrows():
         geometry = row.geometry
         if geometry is None:
             continue
 
-        building_height, roof_shape = _resolve_building_height_and_roof(row, float(extrusion_height))
+        _ms_default = float(extrusion_height)
+        if _ms_tree is not None:
+            try:
+                _c = geometry.centroid
+                _ms_dist, _ms_idx = _ms_tree.query([float(_c.x), float(_c.y)])
+                if _ms_dist < 30.0 and float(_ms_heights[_ms_idx]) > 0.0:
+                    _ms_default = float(_ms_heights[_ms_idx])
+            except Exception:
+                pass
+        building_height, roof_shape = _resolve_building_height_and_roof(row, _ms_default)
+
+        # NOTE: no DEM lift here — the scene renders flat by default and
+        # TerrainMixin._drape_buildings lifts building actors dynamically when
+        # the Terrain toggle is on.  Baking the lift made buildings float
+        # above the flat roads (and double-lifted them with terrain active).
 
         for poly in _iter_polygon_parts(geometry):
             footprint = _polygon_to_footprint(poly)
@@ -620,7 +1072,6 @@ def build_3d_buildings_and_street_graph(
                 com_points.append((poly.centroid.x, poly.centroid.y))
                 
             refined.cell_data["building_class"] = np.full(refined.n_cells, bclass, dtype=np.uint8)
-
             extruded_meshes.append(refined)
             _n_buildings += 1
             if _n_buildings % 50 == 0:
@@ -642,6 +1093,14 @@ def build_3d_buildings_and_street_graph(
                 if footprint is None or footprint.n_points < 3: continue
                 park_extruded = footprint.extrude((0.0, 0.0, 0.02), capping=True)
                 if park_extruded.n_points > 0:
+                    if _dem_sampler is not None:
+                        try:
+                            _pc = poly.centroid
+                            _pz = float(_dem_sampler(np.array([[float(_pc.x), float(_pc.y)]]))[0])
+                            if _pz != 0.0:
+                                park_extruded = park_extruded.translate([0.0, 0.0, _pz])
+                        except Exception:
+                            pass
                     park_meshes.append(park_extruded)
     
     if park_meshes:
@@ -685,4 +1144,70 @@ def build_3d_buildings_and_street_graph(
             for n in c_nodes:
                 projected_graph.nodes[n]["is_commercial"] = True
 
-    return combined_mesh, projected_graph, [], park_combined
+    # Collect tree positions (individual nodes + sampled points inside forest areas)
+    _tree_data: list[dict] = []
+    for _, _tr in proj_trees.iterrows():
+        _tg = _tr.geometry
+        if _tg is None or not hasattr(_tg, "x"):
+            continue  # skip Ways/Relations — only Point nodes
+        _sp = str(_tr.get("species", _tr.get("species:en", _tr.get("taxon", "")))).lower()
+        _tree_data.append({"x": float(_tg.x), "y": float(_tg.y), "species": _sp})
+    from shapely.geometry import Point as _ShPt
+    for _, _fr in proj_forests.iterrows():
+        _fg = _fr.geometry
+        if _fg is None or _fg.is_empty:
+            continue
+        _fb = _fg.bounds
+        _nft = 0
+        for _fx in np.arange(_fb[0] + 5.0, _fb[2], 15.0):
+            for _fy in np.arange(_fb[1] + 5.0, _fb[3], 15.0):
+                if _nft >= 40:
+                    break
+                if _fg.contains(_ShPt(_fx, _fy)):
+                    _tree_data.append({"x": float(_fx), "y": float(_fy), "species": ""})
+                    _nft += 1
+            if _nft >= 40:
+                break
+    if _tree_data:
+        print(f"[trees] {len(_tree_data)} trees fetched ({sum(1 for t in _tree_data if t['species'])} with species tag)")
+    projected_graph.graph["trees"] = _tree_data
+
+    # Build crossing data: position + road direction for each highway=crossing node
+    _cross_data: list[dict] = []
+    if not proj_crossings.empty:
+        _emids: list = []
+        _edirs: list = []
+        for _eu, _ev, _edata in projected_graph.edges(data=True):
+            _eg = _edata.get("geometry")
+            if _eg is not None and hasattr(_eg, "coords"):
+                _ec = np.asarray(_eg.coords, dtype=float)
+            else:
+                _un = projected_graph.nodes.get(_eu, {})
+                _vn = projected_graph.nodes.get(_ev, {})
+                if "x" not in _un or "x" not in _vn:
+                    continue
+                _ec = np.array([[_un["x"], _un["y"]], [_vn["x"], _vn["y"]]])
+            if len(_ec) < 2:
+                continue
+            _emids.append(_ec[len(_ec) // 2, :2])
+            _ev2 = _ec[-1, :2] - _ec[0, :2]
+            _en = np.linalg.norm(_ev2)
+            _edirs.append(_ev2 / _en if _en > 0 else np.array([1.0, 0.0]))
+        if _emids:
+            from scipy.spatial import cKDTree as _CKDx
+            _ek = _CKDx(np.array(_emids))
+            for _, _cr in proj_crossings.iterrows():
+                _cg = _cr.geometry
+                if _cg is None or not hasattr(_cg, "x"):
+                    continue
+                _cx2, _cy2 = float(_cg.x), float(_cg.y)
+                _, _ei = _ek.query([_cx2, _cy2])
+                _dx2, _dy2 = float(_edirs[_ei][0]), float(_edirs[_ei][1])
+                _cross_data.append({"x": _cx2, "y": _cy2, "dx": _dx2, "dy": _dy2})
+            if len(_cross_data) > 200:
+                _cross_data = _cross_data[:200]
+    if _cross_data:
+        print(f"[crossings] {len(_cross_data)} pedestrian crossings")
+    projected_graph.graph["crossings"] = _cross_data
+
+    return combined_mesh, projected_graph, [], park_combined, None

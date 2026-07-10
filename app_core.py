@@ -92,11 +92,56 @@ def _segments_to_polydata(segments: list[tuple[np.ndarray, np.ndarray]]) -> pv.P
     return poly
 
 
+def _edge_bridge_height(data) -> float:
+    """Elevation (m) for a bridge/overpass edge, 0.0 for ground-level edges.
+
+    Uses the OSM `bridge` tag (any value except "no") and the `layer` tag
+    (stacked crossings: layer=2 rides above layer=1).
+    """
+    bridge = data.get("bridge")
+    if isinstance(bridge, (list, tuple)):
+        bridge = bridge[0] if bridge else None
+    is_bridge = bridge not in (None, False, "no", "")
+    if not is_bridge:
+        return 0.0
+    try:
+        layer = data.get("layer")
+        if isinstance(layer, (list, tuple)):
+            layer = layer[0] if layer else 1
+        layer_n = max(1, int(float(layer)))
+    except (TypeError, ValueError):
+        layer_n = 1
+    return 5.0 * layer_n
+
+
+def _bridge_z_offsets(xy: np.ndarray, height: float, ramp_len: float = 18.0) -> np.ndarray:
+    """Per-vertex z offsets giving a ramped bridge profile along a polyline.
+
+    Rises linearly from 0 at each end to `height` over `ramp_len` metres, so
+    vehicles/lines climb onto the deck instead of teleporting up.  Bridges
+    shorter than 2×ramp_len peak at their midpoint proportionally.
+    """
+    seg = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
+    cum = np.concatenate(([0.0], np.cumsum(seg)))
+    total = float(cum[-1])
+    if total <= 1e-6 or height <= 0.0:
+        return np.zeros(xy.shape[0], dtype=float)
+    ramp = min(float(ramp_len), total / 2.0)
+    from_start = cum
+    from_end = total - cum
+    return height * np.clip(np.minimum(from_start, from_end) / max(ramp, 1e-6), 0.0, 1.0)
+
+
 def _street_line_layers(street_graph) -> tuple[pv.PolyData | None, pv.PolyData | None]:
-    """Split graph edges into vehicle and pedestrian polyline layers."""
+    """Split graph edges into vehicle and pedestrian polyline layers.
+
+    Bridge/overpass edges (OSM `bridge` tag) are elevated with a ramped
+    profile so they render above the crossing road instead of overlapping it.
+    """
     ped_tags = {"footway", "pedestrian", "path", "cycleway", "steps", "bridleway"}
     vehicle_segments: list[tuple[np.ndarray, np.ndarray]] = []
     ped_segments: list[tuple[np.ndarray, np.ndarray]] = []
+    _BASE_Z = 0.35   # above road (0.1) and sidewalk (0.15) surfaces — always visible
 
     for u, v, data in street_graph.edges(data=True):
         hw = data.get("highway")
@@ -108,23 +153,28 @@ def _street_line_layers(street_graph) -> tuple[pv.PolyData | None, pv.PolyData |
             hw_vals = {str(hw)}
 
         is_ped = len(hw_vals & ped_tags) > 0
+        bridge_h = _edge_bridge_height(data)
 
         geom = data.get("geometry")
         if geom is not None and hasattr(geom, "coords"):
             coords = np.asarray(geom.coords, dtype=float)
             if coords.shape[0] >= 2:
                 xy = coords[:, :2]
+                bz = _bridge_z_offsets(xy, bridge_h)
                 for i in range(xy.shape[0] - 1):
-                    a = np.array([xy[i, 0], xy[i, 1], 0.05], dtype=float)
-                    b = np.array([xy[i + 1, 0], xy[i + 1, 1], 0.05], dtype=float)
+                    a = np.array([xy[i, 0], xy[i, 1], _BASE_Z + bz[i]], dtype=float)
+                    b = np.array([xy[i + 1, 0], xy[i + 1, 1], _BASE_Z + bz[i + 1]], dtype=float)
                     (ped_segments if is_ped else vehicle_segments).append((a, b))
                 continue
 
         nu = street_graph.nodes.get(u, {})
         nv = street_graph.nodes.get(v, {})
         if "x" in nu and "y" in nu and "x" in nv and "y" in nv:
-            a = np.array([float(nu["x"]), float(nu["y"]), 0.05], dtype=float)
-            b = np.array([float(nv["x"]), float(nv["y"]), 0.05], dtype=float)
+            _xy2 = np.array([[float(nu["x"]), float(nu["y"])],
+                             [float(nv["x"]), float(nv["y"])]], dtype=float)
+            bz = _bridge_z_offsets(_xy2, bridge_h)
+            a = np.array([_xy2[0, 0], _xy2[0, 1], _BASE_Z + bz[0]], dtype=float)
+            b = np.array([_xy2[1, 0], _xy2[1, 1], _BASE_Z + bz[1]], dtype=float)
             (ped_segments if is_ped else vehicle_segments).append((a, b))
 
     return _segments_to_polydata(vehicle_segments), _segments_to_polydata(ped_segments)
@@ -379,10 +429,12 @@ def _load_or_fetch_osm_cached(
     cache_dir: Path,
     use_cache: bool,
     data_source: str = "overture",
+    use_dem: bool = True,
+    use_ms_buildings: bool = True,
 ) -> tuple[pv.PolyData, object, pv.PolyData, pv.PolyData, list]:
     key = _cache_key(
         "osm",
-        "v10_parking_bclass",
+        "v12_flat_buildings",   # v12: buildings no longer baked at DEM height
         data_source,
         address,
         radius,
@@ -397,6 +449,8 @@ def _load_or_fetch_osm_cached(
     road_path = cache_dir / f"osm_{key}_road.vtp"
     sidewalk_path = cache_dir / f"osm_{key}_sidewalk.vtp"
 
+    water_path = cache_dir / f"osm_{key}_water.vtp"
+
     if use_cache and mesh_path.exists() and graph_path.exists():
         buildings_mesh = pv.read(mesh_path)
         with open(graph_path, "rb") as f:
@@ -405,6 +459,7 @@ def _load_or_fetch_osm_cached(
         if road_path.exists() and sidewalk_path.exists():
             road_mesh = pv.read(road_path)
             sidewalk_mesh = pv.read(sidewalk_path)
+            water_mesh = pv.read(water_path) if water_path.exists() else None
         else:
             road_mesh, sidewalk_mesh = build_road_and_sidewalk_meshes_from_graph(
                 projected_graph=street_graph,
@@ -422,16 +477,61 @@ def _load_or_fetch_osm_cached(
                 road_mesh.save(road_path)
                 sidewalk_mesh.save(sidewalk_path)
 
-        # Places are not cached to disk — re-fetch each run (fast network call)
         from overture_source import _geocode_address, _radius_to_bbox, _make_local_transformer, fetch_and_project_places
-        _lat, _lon = _geocode_address(address)
+        _lat, _lon = _geocode_address(address)   # disk-cached geocode
         street_graph.graph["scene_lat"] = float(_lat)
         street_graph.graph["scene_lon"] = float(_lon)
-        _bbox = _radius_to_bbox(_lat, _lon, radius)
-        _to_local, _ = _make_local_transformer(_lat, _lon)
-        places = fetch_and_project_places(_bbox, _to_local, min_confidence=0.75, clip_radius_m=radius)
+
+        # Places: cached to disk — the Overture POI fetch is hundreds of rows
+        # over the network and identical for the same scene key.
+        places_path = cache_dir / f"osm_{key}_places.pkl"
+        places = None
+        if use_cache and places_path.exists():
+            try:
+                with open(places_path, "rb") as _pf:
+                    places = pickle.load(_pf)
+                print(f"[places] loaded {len(places)} POIs from cache")
+            except Exception:
+                places = None
+        if places is None:
+            _bbox = _radius_to_bbox(_lat, _lon, radius)
+            _to_local, _ = _make_local_transformer(_lat, _lon)
+            places = fetch_and_project_places(_bbox, _to_local, min_confidence=0.75, clip_radius_m=radius)
+            if use_cache:
+                try:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    with open(places_path, "wb") as _pf:
+                        pickle.dump(places, _pf)
+                except Exception as _pe:
+                    print(f"[places] cache save failed: {_pe}")
+
+        if use_dem:
+            from osm_3d_buildings import _fetch_dem_sampler
+            _crs = street_graph.graph.get("crs")
+            if _crs is not None:
+                street_graph.graph["terrain_sampler"] = _fetch_dem_sampler(float(_lat), float(_lon), float(radius), str(_crs))
+
+        # Fetch land-use fill mesh if not already in cached graph, or palette changed.
+        _FILL_VER = 3   # bump when _COLOUR palette changes to force re-fetch
+        if "fill_pts" not in street_graph.graph or street_graph.graph.get("fill_ver", 0) < _FILL_VER:
+            try:
+                from osm_3d_buildings import _fetch_land_fill_mesh as _fill_fn
+                _fl_crs = str(street_graph.graph.get("crs", ""))
+                if _fl_crs:
+                    _fill = _fill_fn((float(_lat), float(_lon)), float(radius), _fl_crs)
+                    if _fill is not None and _fill.n_cells > 0:
+                        street_graph.graph["fill_pts"]   = np.asarray(_fill.points,          dtype=float)
+                        street_graph.graph["fill_faces"]  = np.asarray(_fill.faces,           dtype=np.int64)
+                        street_graph.graph["fill_rgb"]    = np.asarray(_fill.cell_data["RGB"], dtype=np.uint8)
+                        street_graph.graph["fill_ver"]   = _FILL_VER
+                        with open(graph_path, "wb") as _gf:
+                            pickle.dump(street_graph, _gf)
+                        print("[fill] updated graph cache with land-use fill data (palette v2)")
+            except Exception as _fe:
+                print(f"[fill] land-use fetch skipped (cached graph): {_fe}")
+
         print(f"Loaded OSM cache: {mesh_path.name}")
-        return buildings_mesh, street_graph, road_mesh, sidewalk_mesh, places
+        return buildings_mesh, street_graph, road_mesh, sidewalk_mesh, places, water_mesh
 
     if data_source == "osm":
         import osm_3d_buildings as src_module
@@ -440,13 +540,15 @@ def _load_or_fetch_osm_cached(
         import overture_source as src_module
         print("[source] Using Overture Maps")
 
-    buildings_mesh, street_graph, places, park_mesh = src_module.build_3d_buildings_and_street_graph(
+    buildings_mesh, street_graph, places, park_mesh, water_mesh = src_module.build_3d_buildings_and_street_graph(
         address=address,
         radius=radius,
         extrusion_height=extrusion_height,
         cache_dir=cache_dir,
         use_cache=use_cache,
         cache_context_key=key,
+        use_dem=use_dem,
+        use_ms_buildings=use_ms_buildings,
     )
     road_mesh, sidewalk_mesh = src_module.build_road_and_sidewalk_meshes_from_graph(
         projected_graph=street_graph,
@@ -455,8 +557,27 @@ def _load_or_fetch_osm_cached(
         road_extrude_z=ROAD_EXTRUDE_Z,
         sidewalk_extrude_z=SIDEWALK_EXTRUDE_Z,
     )
-    if park_mesh is not None:
-        sidewalk_mesh = sidewalk_mesh.merge(park_mesh)
+    # Park mesh intentionally not merged into sidewalk — fill mesh handles park
+    # coloring as flat solid polygons; the extruded park_mesh creates triangulated
+    # walls visible as crosshatch from above.
+
+    # Build and store land-use fill mesh in the graph so it's pickled with cache
+    _FILL_VER = 3
+    if "fill_pts" not in street_graph.graph or street_graph.graph.get("fill_ver", 0) < _FILL_VER:
+        try:
+            from osm_3d_buildings import _fetch_land_fill_mesh as _fill_fn
+            _fl_lat = float(street_graph.graph.get("scene_lat", 0.0))
+            _fl_lon = float(street_graph.graph.get("scene_lon", 0.0))
+            _fl_crs = str(street_graph.graph.get("crs", ""))
+            if _fl_crs:
+                _fill = _fill_fn((_fl_lat, _fl_lon), float(radius), _fl_crs)
+                if _fill is not None and _fill.n_cells > 0:
+                    street_graph.graph["fill_pts"]   = np.asarray(_fill.points,          dtype=float)
+                    street_graph.graph["fill_faces"]  = np.asarray(_fill.faces,           dtype=np.int64)
+                    street_graph.graph["fill_rgb"]    = np.asarray(_fill.cell_data["RGB"], dtype=np.uint8)
+                    street_graph.graph["fill_ver"]   = _FILL_VER
+        except Exception as _fe:
+            print(f"[fill] land-use fetch skipped: {_fe}")
 
     if use_cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -469,11 +590,27 @@ def _load_or_fetch_osm_cached(
         buildings_mesh.save(mesh_path)
         road_mesh.save(road_path)
         sidewalk_mesh.save(sidewalk_path)
+        
+        _ts = street_graph.graph.pop("terrain_sampler", None)
         with open(graph_path, "wb") as f:
             pickle.dump(street_graph, f)
+        if _ts is not None:
+            street_graph.graph["terrain_sampler"] = _ts
+            
+        if water_mesh is not None:
+            if not isinstance(water_mesh, pv.PolyData):
+                water_mesh = water_mesh.extract_surface()
+            water_mesh.save(water_path)
+
+        # Places → disk so cached runs skip the Overture POI fetch entirely
+        try:
+            with open(cache_dir / f"osm_{key}_places.pkl", "wb") as _pf:
+                pickle.dump(places, _pf)
+        except Exception as _pe:
+            print(f"[places] cache save failed: {_pe}")
         print(f"Saved OSM cache: {mesh_path.name}")
 
-    return buildings_mesh, street_graph, road_mesh, sidewalk_mesh, places
+    return buildings_mesh, street_graph, road_mesh, sidewalk_mesh, places, water_mesh
 
 
 def _load_or_build_coverage_matrix_cached(

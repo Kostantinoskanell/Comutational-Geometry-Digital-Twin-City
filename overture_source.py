@@ -29,13 +29,14 @@ from geopy.geocoders import Nominatim
 from pyproj import Geod, Transformer
 from shapely.geometry import (
     LineString,
+    MultiLineString,
     MultiPolygon,
     Point,
     Polygon,
     mapping,
     shape,
 )
-from shapely.ops import unary_union
+from shapely.ops import substring, unary_union
 
 from turn_restrictions import load_osm_direction_graph_cached, resolve_osm_road_direction
 
@@ -58,6 +59,29 @@ except ImportError:
 _PED_CLASSES = {"footway", "pedestrian", "path", "cycleway", "steps", "bridleway",
                 "track", "service"}
 
+ROAD_STYLES = {
+    "motorway":       (7.0,  "#222222", False),
+    "trunk":          (6.5,  "#333333", False),
+    "primary":        (5.5,  "#333333", False),
+    "primary_link":   (4.5,  "#444444", False),
+    "secondary":      (5.0,  "#555555", False),
+    "secondary_link": (4.0,  "#666666", False),
+    "tertiary":       (4.5,  "#777777", False),
+    "tertiary_link":  (3.5,  "#888888", False),
+    "residential":    (4.0,  "#999999", False),
+    "unclassified":   (4.0,  "#999999", False),
+    "living_street":  (3.0,  "#C8B89A", False),
+    "service":        (2.5,  "#C8B89A", False),
+    "road":           (3.5,  "#888888", False),
+    "footway":        (2.0,  "#A0A0A0", True),
+    "path":           (2.0,  "#A0A0A0", True),
+    "pedestrian":     (2.0,  "#A0A0A0", True),
+    "cycleway":       (1.5,  "#E53935", False),
+    "steps":          (1.2,  "#FDD835", True),
+    "track":          (2.0,  "#795548", True),
+    "bridleway":      (2.0,  "#795548", True),
+}
+
 # Default height when Overture has no height and no num_floors
 DEFAULT_BUILDING_HEIGHT_M = 10.0
 METERS_PER_FLOOR = 3.5
@@ -68,12 +92,38 @@ METERS_PER_FLOOR = 3.5
 # ---------------------------------------------------------------------------
 
 def _geocode_address(address: str) -> tuple[float, float]:
-    """Return (lat, lon) for a free-text address via Nominatim."""
+    """Return (lat, lon) for a free-text address via Nominatim.
+
+    Results are cached on disk — addresses never move, and Nominatim is both
+    slow (~1 s) and rate-limited, so a cached scene should not re-geocode.
+    """
+    import hashlib
+    import json
+    from pathlib import Path
+
+    cache_dir = Path(__file__).resolve().parent / "cache"
+    key = hashlib.sha1(address.strip().lower().encode("utf-8")).hexdigest()[:16]
+    cache_file = cache_dir / f"geocode_{key}.json"
+
+    if cache_file.exists():
+        try:
+            d = json.loads(cache_file.read_text())
+            return float(d["lat"]), float(d["lon"])
+        except Exception:
+            pass
+
     geolocator = Nominatim(user_agent="city_digital_twin/1.0")
     location = geolocator.geocode(address, timeout=15)
     if location is None:
         raise ValueError(f"Could not geocode address: {address!r}")
-    return float(location.latitude), float(location.longitude)
+    lat, lon = float(location.latitude), float(location.longitude)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(
+            {"address": address, "lat": lat, "lon": lon}))
+    except Exception:
+        pass
+    return lat, lon
 
 
 def _radius_to_bbox(lat: float, lon: float, radius_m: float) -> tuple[float, float, float, float]:
@@ -137,6 +187,60 @@ def _project_polygon(poly: Polygon, transformer: Transformer) -> Polygon:
 def _project_linestring(line: LineString, transformer: Transformer) -> LineString:
     pts = _project_coords_to_local(list(line.coords), transformer)
     return LineString(pts)
+
+
+# ---------------------------------------------------------------------------
+# Overture: fetch water
+# ---------------------------------------------------------------------------
+
+def _fetch_overture_water(
+    bbox: tuple[float, float, float, float],
+) -> list[Polygon]:
+    """
+    Fetch water polygons from Overture Maps for the given bbox.
+    """
+    if not _OVERTURE_AVAILABLE:
+        return []
+
+    try:
+        reader = overturemaps.record_batch_reader("water", bbox=bbox)
+    except Exception:
+        return []
+
+    water_polys = []
+    import shapely.wkb as _shapely_wkb
+    for batch in reader:
+        batch_dict = batch.to_pydict()
+        if "geometry" not in batch_dict: continue
+        n = len(batch_dict["geometry"])
+
+        for i in range(n):
+            raw_geom = batch_dict["geometry"][i]
+            if raw_geom is None:
+                continue
+            
+            subtype = batch_dict.get("subtype", [None] * n)[i]
+            # Overture subtypes for water theme usually just include water, ocean, river, sea.
+            # We take all polygons returned in the water theme.
+            
+            try:
+                geom = _shapely_wkb.loads(bytes(raw_geom))
+            except Exception:
+                try:
+                    geom = shape(raw_geom)
+                except Exception:
+                    continue
+
+            if geom is None or geom.is_empty:
+                continue
+
+            # Yield individual polygons
+            if isinstance(geom, Polygon):
+                water_polys.append(geom)
+            elif isinstance(geom, MultiPolygon):
+                water_polys.extend([p for p in geom.geoms if not p.is_empty])
+
+    return water_polys
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +721,9 @@ def _build_buildings_mesh(
     buildings: list[dict],
     transformer: Transformer,
     extrusion_height: float,
+    dem_sampler=None,
+    ms_tree=None,
+    ms_heights=None,
 ) -> pv.PolyData:
     """Convert Overture building features → single merged PyVista PolyData."""
     meshes = []
@@ -624,7 +731,30 @@ def _build_buildings_mesh(
     class_map = {"concrete": 0, "brick": 1, "glass": 2, "wood": 0, "metal": 2, "stone": 1}
     for b in buildings:
         geom = b["geometry"]
-        height = _resolve_height(b, extrusion_height)
+
+        # Local centroid for DEM / MS height lookups
+        _g0 = list(geom.geoms)[0] if isinstance(geom, MultiPolygon) else geom
+        # transformer is always_xy=True → expects (lon, lat) = (centroid.x, centroid.y)
+        _cx_local, _cy_local = transformer.transform(float(_g0.centroid.x), float(_g0.centroid.y))
+
+        # MS Buildings height override (used only when Overture has no height data)
+        _ms_default = extrusion_height
+        if ms_tree is not None:
+            try:
+                _ms_dist, _ms_idx = ms_tree.query([_cx_local, _cy_local])
+                if _ms_dist < 30.0 and float(ms_heights[_ms_idx]) > 0.0:
+                    _ms_default = float(ms_heights[_ms_idx])
+            except Exception:
+                pass
+
+        height = _resolve_height(b, _ms_default)
+
+        # NOTE: buildings are NOT lifted to DEM height here.  The scene renders
+        # flat (z=0) by default; TerrainMixin._drape_buildings lifts the actor
+        # geometry dynamically when the Terrain toggle is enabled.  Baking the
+        # lift into the mesh made buildings float above the flat roads (and
+        # double-lifted them when terrain draping was on).
+
         # Use facade_material for building_class, fallback to height heuristic
         material = b.get("facade_material") or "concrete"
         bclass = class_map.get(str(material).lower(), 0)
@@ -890,11 +1020,21 @@ def _fetch_overture_connectors(
 
 
 # ---------------------------------------------------------------------------
+
+def _dash_linestring(geom: LineString, dash_len: float = 1.0, gap_len: float = 1.0) -> MultiLineString:
+    dashes = []
+    d = 0.0
+    L = geom.length
+    while d < L:
+        end = min(d + dash_len, L)
+        dashes.append(substring(geom, d, end))
+        d += dash_len + gap_len
+    return MultiLineString(dashes) if dashes else MultiLineString()
 # Road & sidewalk surface meshes (same logic as osm_3d_buildings.py)
 # ---------------------------------------------------------------------------
 
 def _buffer_linestring_mesh(
-    line: LineString,
+    line: LineString | MultiLineString,
     buffer_m: float,
     extrude_z: float,
 ) -> Optional[pv.PolyData]:
@@ -903,7 +1043,23 @@ def _buffer_linestring_mesh(
         poly = line.buffer(buffer_m, cap_style=2, join_style=2)
         if poly.is_empty or not poly.is_valid:
             return None
-        return _polygon_to_pyvista(poly, extrude_z)
+            
+        meshes = []
+        if isinstance(poly, MultiPolygon):
+            for p in poly.geoms:
+                m = _polygon_to_pyvista(p, extrude_z)
+                if m is not None:
+                    meshes.append(m)
+        else:
+            m = _polygon_to_pyvista(poly, extrude_z)
+            if m is not None:
+                meshes.append(m)
+                
+        if not meshes:
+            return None
+        if len(meshes) == 1:
+            return meshes[0]
+        return meshes[0].merge(meshes[1:], merge_points=False)
     except Exception:
         return None
 
@@ -935,13 +1091,18 @@ def build_road_and_sidewalk_meshes_from_graph(
             geom = LineString([(nu["x"], nu["y"]), (nv["x"], nv["y"])])
 
         is_ped = hw in _PED_CLASSES
-        if is_ped:
-            m = _buffer_linestring_mesh(geom, sidewalk_buffer_m, sidewalk_extrude_z)
-            if m is not None and m.n_points > 0:
+        style = ROAD_STYLES.get(hw, (road_buffer_m if not is_ped else sidewalk_buffer_m, "#555555", False))
+        width, color_hex, is_dashed = style
+
+        geom_to_buffer = _dash_linestring(geom) if is_dashed else geom
+        
+        m = _buffer_linestring_mesh(geom_to_buffer, width, sidewalk_extrude_z if is_ped else road_extrude_z)
+        if m is not None and m.n_points > 0:
+            c = [int(color_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)]
+            m.cell_data["RGB"] = np.tile(c, (m.n_cells, 1))
+            if is_ped:
                 sidewalk_meshes.append(m)
-        else:
-            m = _buffer_linestring_mesh(geom, road_buffer_m, road_extrude_z)
-            if m is not None and m.n_points > 0:
+            else:
                 road_meshes.append(m)
 
     def _merge(meshes: list[pv.PolyData]) -> pv.PolyData:
@@ -1145,7 +1306,7 @@ def _fetch_overture_places(
 def fetch_and_project_places(
     bbox: tuple[float, float, float, float],
     transformer: Transformer,
-    min_confidence: float = 0.7,
+    min_confidence: float = 0.9,
     clip_radius_m: float | None = None,
 ) -> list[dict]:
     """
@@ -1179,6 +1340,8 @@ def build_3d_buildings_and_street_graph(
     cache_dir: Path | None = None,
     use_cache: bool = False,
     cache_context_key: str = "",
+    use_dem: bool = True,
+    use_ms_buildings: bool = True,
 ) -> tuple[pv.PolyData, nx.MultiDiGraph, list[dict]]:
     """
     Fetch Overture Maps data and build a 3D city model.
@@ -1218,13 +1381,36 @@ def build_3d_buildings_and_street_graph(
     # 3. Build local metric projection (origin = scene centre)
     to_local, _ = _make_local_transformer(lat, lon)
     target_crs = getattr(to_local, "target_crs", None)
+    proj_str = (
+        str(target_crs) if target_crs
+        else f"+proj=tmerc +lat_0={lat} +lon_0={lon} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+    )
+
+    # 3.5 DEM and MS Buildings (best-effort; silently skipped on missing deps / network error)
+    from osm_3d_buildings import (
+        _fetch_ms_building_heights as _fetch_ms,
+        _fetch_dem_sampler as _fetch_dem,
+    )
+    _ms_centroids, _ms_heights, _ms_tree = (
+        _fetch_ms(float(lat), float(lon), float(radius), proj_str)
+        if use_ms_buildings else (None, None, None)
+    )
+    _dem_sampler = (
+        _fetch_dem(float(lat), float(lon), float(radius), proj_str)
+        if use_dem else None
+    )
 
     # 4. Fetch and build buildings
     print("[Overture] Fetching buildings...")
     buildings = _fetch_overture_buildings(bbox)
     print(f"[Overture] {len(buildings)} building features received")
 
-    buildings_mesh = _build_buildings_mesh(buildings, to_local, extrusion_height)
+    buildings_mesh = _build_buildings_mesh(
+        buildings, to_local, extrusion_height,
+        dem_sampler=_dem_sampler,
+        ms_tree=_ms_tree,
+        ms_heights=_ms_heights,
+    )
     print(
         f"[Overture] Buildings mesh: "
         f"{buildings_mesh.n_points} points, {buildings_mesh.n_cells} cells"
@@ -1246,6 +1432,11 @@ def build_3d_buildings_and_street_graph(
     class_counts = Counter(s.get("class_", "unknown") for s in segments)
     print(f"[Overture] Segment classes: {dict(class_counts)}")
 
+    # 5.5 Fetch water polygons
+    print("[Overture] Fetching water polygons...")
+    water_polys = _fetch_overture_water(bbox_roads)
+    print(f"[Overture] {len(water_polys)} water polygons received")
+
     osm_direction_graph = load_osm_direction_graph_cached(
         bbox_wsen=bbox_roads,
         target_crs=target_crs,
@@ -1263,6 +1454,8 @@ def build_3d_buildings_and_street_graph(
     street_graph.graph["scene_lon"] = float(lon)
     street_graph.graph["source_bbox_wsen"] = bbox_roads
     street_graph.graph["crs"] = target_crs
+    if _dem_sampler is not None:
+        street_graph.graph["terrain_sampler"] = _dem_sampler
     print(
         f"[Overture] Street graph: "
         f"{street_graph.number_of_nodes()} nodes, "
@@ -1308,10 +1501,9 @@ def build_3d_buildings_and_street_graph(
         from osm_3d_buildings import _iter_polygon_parts, _polygon_to_footprint, _apply_surface_color, PARK_SURFACE_RGB
         
         center = (lat, lon)
-        proj_str = target_crs if target_crs else f"+proj=tmerc +lat_0={lat} +lon_0={lon} +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
-        
         park_tags = {"leisure": "park", "landuse": ["grass", "meadow", "recreation_ground", "village_green"]}
         try:
+            print("[Overture/OSM] Fetching parks via Overpass API...")
             parks: gpd.GeoDataFrame = ox.features_from_point(center, tags=park_tags, dist=radius)
             projected_parks = parks.to_crs(proj_str) if not parks.empty else gpd.GeoDataFrame()
         except Exception:
@@ -1319,6 +1511,7 @@ def build_3d_buildings_and_street_graph(
 
         parking_tags = {"amenity": "parking"}
         try:
+            print("[Overture/OSM] Fetching parking via Overpass API...")
             parking: gpd.GeoDataFrame = ox.features_from_point(center, tags=parking_tags, dist=radius)
             projected_parking = parking.to_crs(proj_str) if not parking.empty else gpd.GeoDataFrame()
         except Exception:
@@ -1334,6 +1527,8 @@ def build_3d_buildings_and_street_graph(
                     if footprint is None or footprint.n_points < 3: continue
                     park_extruded = footprint.extrude((0.0, 0.0, 0.02), capping=True)
                     if park_extruded.n_points > 0:
+                        # Flat like the rest of the scene — terrain drape
+                        # (fill-mesh lift) handles elevation when enabled.
                         park_meshes.append(park_extruded)
         
         if park_meshes:
@@ -1362,6 +1557,31 @@ def build_3d_buildings_and_street_graph(
             else:
                 park_combined = parking_combined
                 
+        # Build water meshes
+        water_meshes = []
+        if water_polys:
+            from shapely.geometry import Point as _Pt
+            clip_circle = _Pt(0.0, 0.0).buffer(float(radius))
+            for poly in water_polys:
+                poly_local = _project_polygon(poly, to_local)
+                clipped = poly_local.intersection(clip_circle)
+                if clipped.is_empty:
+                    continue
+                for p in _iter_polygon_parts(clipped):
+                    footprint = _polygon_to_footprint(p)
+                    if footprint is None or footprint.n_points < 3:
+                        continue
+                    # Thin flat layer at Z=0.01 (above mathematical zero, below roads)
+                    w_extruded = footprint.extrude((0.0, 0.0, 0.01), capping=True)
+                    if w_extruded.n_points > 0:
+                        water_meshes.append(w_extruded)
+        
+        if water_meshes:
+            water_combined = pv.MultiBlock(water_meshes).combine(merge_points=False)
+            water_combined = _apply_surface_color(water_combined, np.array([0x00, 0x69, 0x94], dtype=np.uint8))
+        else:
+            water_combined = None
+
         # Fetch traffic signals and stop signs from OSM and map to nearest Overture graph node
         ts_tags = {"highway": ["traffic_signals", "stop"]}
         try:
@@ -1397,7 +1617,45 @@ def build_3d_buildings_and_street_graph(
         except Exception:
             pass
 
-    except Exception:
-        park_combined = None
+        # Pedestrian crossings from OSM
+        crossing_tags = {"highway": "crossing"}
+        try:
+            cross_gdf: gpd.GeoDataFrame = ox.features_from_point(center, tags=crossing_tags, dist=radius)
+            if not cross_gdf.empty:
+                cross_proj = cross_gdf.to_crs(proj_str)
+                _emids: list = []
+                _edirs: list = []
+                for _eu, _ev, _edata in street_graph.edges(data=True):
+                    _eg = _edata.get("geometry")
+                    if _eg is not None and hasattr(_eg, "coords"):
+                        _ec = np.asarray(_eg.coords, dtype=float)
+                    else:
+                        _un = street_graph.nodes.get(_eu, {}); _vn = street_graph.nodes.get(_ev, {})
+                        if "x" not in _un or "x" not in _vn: continue
+                        _ec = np.array([[_un["x"], _un["y"]], [_vn["x"], _vn["y"]]])
+                    if len(_ec) < 2: continue
+                    _emids.append(_ec[len(_ec) // 2, :2])
+                    _ev2 = _ec[-1, :2] - _ec[0, :2]; _en = np.linalg.norm(_ev2)
+                    _edirs.append(_ev2 / _en if _en > 0 else np.array([1.0, 0.0]))
+                _cross_data: list[dict] = []
+                if _emids:
+                    from scipy.spatial import cKDTree as _CKDx
+                    _ek = _CKDx(np.array(_emids))
+                    for _, _cr in cross_proj.iterrows():
+                        _cg = _cr.geometry
+                        if _cg is None or not hasattr(_cg, "x"): continue
+                        _cx2, _cy2 = float(_cg.x), float(_cg.y)
+                        _, _ei = _ek.query([_cx2, _cy2])
+                        _cross_data.append({"x": _cx2, "y": _cy2, "dx": float(_edirs[_ei][0]), "dy": float(_edirs[_ei][1])})
+                    if len(_cross_data) > 200:
+                        _cross_data = _cross_data[:200]
+                street_graph.graph["crossings"] = _cross_data
+        except Exception:
+            pass
 
-    return buildings_mesh, street_graph, places, park_combined
+    except Exception as _exc:
+        print(f"[Overture] Park/Water extraction error: {_exc}")
+        park_combined = None
+        water_combined = None
+
+    return buildings_mesh, street_graph, places, park_combined, water_combined

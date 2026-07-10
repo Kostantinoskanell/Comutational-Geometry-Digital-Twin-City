@@ -1,0 +1,22 @@
+#!/bin/sh
+# pre-commit — run the headless test suite before every commit.
+# Installed via:  git config core.hooksPath .githooks
+# Bypass once with:  git commit --no-verify
+
+echo "[pre-commit] running headless test suite…"
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT" || exit 1
+
+PY=${PYTHON:-python3}
+$PY tests/run_tests.py
+STATUS=$?
+
+if [ $STATUS -ne 0 ]; then
+    echo ""
+    echo "[pre-commit] ✗ tests failed — commit blocked."
+    echo "[pre-commit]   Fix the failures or bypass once with: git commit --no-verify"
+    exit 1
+fi
+
+echo "[pre-commit] ✓ all tests passed."
+exit 0

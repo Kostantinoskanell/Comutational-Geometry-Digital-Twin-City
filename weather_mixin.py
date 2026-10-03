@@ -33,6 +33,8 @@ class WeatherMixin:
             "_last_t": 0.0,
             "_key_registered": False,
             "_car_base_speed": None,
+            "rain_scale": 1.0,       # 0..1 share of drops shown (hyetograph-driven during the flood replay)
+            "_rain_k": None,
         }
 
     # ------------------------------------------------------------------
@@ -140,8 +142,11 @@ class WeatherMixin:
             road_actor.GetProperty().SetColor(r, g, b)
             road_actor.GetProperty().SetSpecular(0.45 * wf)
             road_actor.GetProperty().SetSpecularPower(60)
+            road_actor.GetProperty().SetRoughness(0.9 - 0.65 * wf)     # PBR: wet asphalt is glossy
         except Exception:
             pass
+        if hasattr(self, "_set_wet_film"):
+            self._set_wet_film(wf)
 
     def _reset_wet_road(self) -> None:
         road_actor = self.scene_state.get("vehicle_actor")
@@ -152,65 +157,108 @@ class WeatherMixin:
             rgb = pv.Color(str(style["vehicle"])).float_rgb
             road_actor.GetProperty().SetColor(*rgb)
             road_actor.GetProperty().SetSpecular(0.0)
+            road_actor.GetProperty().SetRoughness(0.9)
         except Exception:
             pass
+        if hasattr(self, "_set_wet_film"):
+            self._set_wet_film(0.0)
 
     # ------------------------------------------------------------------
     # Rain tick
     # ------------------------------------------------------------------
 
-    def _tick_rain(self, dt: float) -> None:
-        bx0, bx1, by0, by1, _, bz1 = self._weather_bounds
-        N = 1800
+    def _rain_volume(self) -> tuple[np.ndarray, float, float, float]:
+        """(centre xy, half-size, ground z, top z) of the box the rain falls in.
 
-        if self.weather["rain_pts"] is None:
+        Street-level / perspective cameras: a box in front of the camera sized to the view
+        distance. Parallel (isometric overview) or far cameras: the camera sits kilometres
+        away along the view axis, so the box is built around the FOCAL POINT instead (a column
+        ~half the visible width wide and ~120 m tall), which is what the screen shows."""
+        cam = self.plotter.camera
+        pos = np.asarray(cam.position, dtype=float)
+        fp = np.asarray(cam.focal_point, dtype=float)
+        parallel = bool(cam.GetParallelProjection())
+        dist = float(np.linalg.norm(fp - pos))
+        if parallel or dist > 600.0:
+            scale = float(cam.GetParallelScale()) if parallel else dist * 0.5
+            R = float(np.clip(1.15 * scale, 80.0, 800.0))
+            ground = float(fp[2]) - 10.0
+            return fp[:2].copy(), R, ground, ground + 130.0
+        v = fp - pos
+        n = float(np.linalg.norm(v[:2]))
+        d_xy = v[:2] / n if n > 1e-6 else np.array([0.0, 1.0])
+        R = float(np.clip(0.42 * dist, 35.0, 420.0))
+        centre = pos[:2] + d_xy * min(0.6 * R, 0.5 * dist)
+        ground = float(min(fp[2], pos[2])) - 5.0
+        top = float(max(pos[2], fp[2])) + float(np.clip(0.5 * R, 30.0, 160.0))
+        return centre, R, ground, top
+
+    def _tick_rain(self, dt: float) -> None:
+        N = 14000
+        c, R, g0, top = self._rain_volume()
+        if self.weather["rain_pts"] is None or len(self.weather["rain_pts"]) != N:
             rng = np.random.default_rng(7)
             self.weather["rain_pts"] = np.column_stack([
-                rng.uniform(bx0, bx1, N).astype(float),
-                rng.uniform(by0, by1, N).astype(float),
-                rng.uniform(3.0, bz1, N).astype(float),
-            ])
+                rng.uniform(-R, R, N) + c[0], rng.uniform(-R, R, N) + c[1], rng.uniform(g0, top, N)])
 
         pts: np.ndarray = self.weather["rain_pts"]
-        pts[:, 2] -= 18.0 * dt
-
-        below = pts[:, 2] < 0.0
-        n_below = int(np.sum(below))
-        if n_below:
-            rng2 = np.random.default_rng(int(time.perf_counter() * 1e6) & 0xFFFFFF)
-            pts[below, 0] = rng2.uniform(bx0, bx1, n_below)
-            pts[below, 1] = rng2.uniform(by0, by1, n_below)
-            pts[below, 2] = rng2.uniform(bz1 * 0.5, bz1, n_below)
+        pts[:, 2] -= 11.0 * dt                        # m/s: visual terminal speed (keeps streaks legible at 12 fps)
+        pts[:, 0] += 1.8 * dt                         # light wind slant
+        # wrap inside the camera-centred box: drops keep falling as the view moves
+        pts[:, 0] = c[0] + (pts[:, 0] - c[0] + R) % (2 * R) - R
+        pts[:, 1] = c[1] + (pts[:, 1] - c[1] + R) % (2 * R) - R
+        span = max(top - g0, 1.0)
+        pts[:, 2] = g0 + (pts[:, 2] - g0) % span      # re-enter at the top of the box
 
         self.weather["rain_pts"] = pts
-        self.weather["wet_factor"] = min(1.0, float(self.weather["wet_factor"]) + dt * 0.5)
+        if self.weather.get("wet_override") is not None:      # rain that has actually fallen
+            self.weather["wet_factor"] = float(self.weather["wet_override"])
+        else:
+            self.weather["wet_factor"] = min(1.0, float(self.weather["wet_factor"]) + dt * 0.5)
         self._apply_wet_road(float(self.weather["wet_factor"]))
         self._apply_weather_car_factor(0.60)   # was 0.75 — too subtle to notice
 
-        # Build/update line-segment mesh (each drop = 2m vertical streak)
+        # Each drop is a streak; its length grows with the view size so it reads at any zoom.
+        L = float(np.clip(R * 0.05, 2.0, 22.0))
         ends = pts.copy()
-        ends[:, 2] -= 2.0
+        ends[:, 2] -= L
+        ends[:, 0] -= 0.18 * L
         line_pts = np.empty((N * 2, 3), dtype=float)
         line_pts[0::2] = pts
         line_pts[1::2] = ends
 
-        if self.weather["rain_pd"] is None or self.weather["rain_actor"] is None:
-            conn = np.empty(N * 3, dtype=np.int64)
+        # Streak density follows the rain intensity (flood replay drives
+        # rain_scale from the storm hyetograph; 1.0 = the manual Weather mode).
+        k = int(round(N * float(np.clip(self.weather.get("rain_scale", 1.0), 0.0, 1.0))))
+        k = max(k, 1) if self.weather.get("rain_scale", 1.0) > 0.0 else 0
+
+        def _conn(k):
+            conn = np.empty(k * 3, dtype=np.int64)
             conn[0::3] = 2
-            conn[1::3] = np.arange(0, N * 2, 2, dtype=np.int64)
-            conn[2::3] = np.arange(1, N * 2, 2, dtype=np.int64)
+            conn[1::3] = np.arange(0, k * 2, 2, dtype=np.int64)
+            conn[2::3] = np.arange(1, k * 2, 2, dtype=np.int64)
+            return conn
+
+        if self.weather["rain_pd"] is not None and self.weather.get("_rain_k") != k:
+            self.weather["rain_pd"].lines = _conn(k)
+            self.weather["_rain_k"] = k
+        if self.weather["rain_pd"] is None or self.weather["rain_actor"] is None:
+            conn = _conn(k)
+            self.weather["_rain_k"] = k
             rain_pd = pv.PolyData()
             rain_pd.points = line_pts
             rain_pd.lines  = conn
             self.weather["rain_pd"] = rain_pd
             self.weather["rain_actor"] = self.plotter.add_mesh(
                 rain_pd,
-                color="#a0c8f8",
-                opacity=0.55,
+                color="#b8d4f8",
+                opacity=0.65,
                 lighting=False,
-                line_width=1.5,
+                line_width=2.2,
                 name="weather_rain",
+                reset_camera=False,
             )
+            self.weather["rain_actor"].PickableOff()
         else:
             self.weather["rain_pd"].points = line_pts
 
@@ -347,8 +395,10 @@ class WeatherMixin:
         except Exception as exc:
             print(f"[weather] tick error: {exc}")
 
-        # HUD label
+        # HUD label (the Flood Lab run drives rain itself and has its own HUD)
         labels = {"clear": "", "rain": "🌧 Rain  (slowing traffic)", "snow": "❄ Snow  (slowing traffic)"}
+        if self.weather.get("wet_override") is not None:
+            labels["rain"] = ""
         try:
             self.plotter.add_text(
                 labels.get(mode, ""),

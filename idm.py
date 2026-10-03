@@ -584,9 +584,19 @@ def _advance_positions(
                                     cur = int(matches[0])
                             if cur + 1 < plan_arr.size:
                                 candidate = int(plan_arr[cur + 1])
-                                if nexts.size == 0 or bool(np.any(nexts == candidate)):
+                                if bool(np.any(nexts == candidate)):
                                     forced_next = candidate
                                     planned_cursor[i] = cur + 1
+                                else:
+                                    # The planned next edge isn't a real graph
+                                    # successor of the edge the car is actually
+                                    # on (stale plan, or nexts has no data for
+                                    # this node) — teleporting onto it would
+                                    # jump the car onto a disconnected edge.
+                                    # Abandon the plan; fall through to the
+                                    # normal random-successor / dead-end
+                                    # handling below like an unplanned car.
+                                    planned_edges[i] = None
                             else:
                                 planned_edges[i] = None
                 except Exception:
@@ -652,6 +662,7 @@ def idm_tick(
     roundabout_yield_map: dict[int, np.ndarray] | None = None,
     adj_left:  np.ndarray | None = None,   # (P,) int64, adjacent lane left
     adj_right: np.ndarray | None = None,   # (P,) int64, adjacent lane right
+    speed_cap: np.ndarray | None = None,   # (N,) m/s, per-car ceiling on v0 this tick
 ) -> None:
     """Full IDM simulation tick. Mutates car_anim in-place.
 
@@ -665,6 +676,10 @@ def idm_tick(
     params         : IDMParams instance.
     rng            : numpy Generator used for stochastic edge-hop choices.
     traffic_speed  : global multiplier applied to road speed limits.
+    speed_cap      : optional per-car upper bound on the desired speed for this
+                     tick only (np.inf = uncapped) — yielding to pedestrians or
+                     an emergency vehicle. desired_base is untouched, so cars
+                     re-accelerate as soon as the cap is lifted.
     """
     if not bool(car_anim.get("enabled", False)):
         return
@@ -681,6 +696,10 @@ def idm_tick(
     else:
         desired_base = np.array(desired_base_raw, dtype=float)
     desired  = desired_base * float(traffic_speed)
+    if speed_cap is not None:
+        _cap = np.asarray(speed_cap, dtype=float)
+        if _cap.shape == desired.shape:
+            desired = np.minimum(desired, _cap)
     car_len  = np.asarray(car_anim["car_len"],     dtype=float)   # read-only
 
     car_path_lengths = np.asarray(
@@ -767,7 +786,15 @@ def idm_tick(
     #   v_new = clip( v + a·dt,  lower=0,  upper=v₀ )
     #   • lower=0  → no reversal
     #   • upper=v₀ → no overspeed past desired free-flow target
-    speed = np.clip(speed + accel * float(dt), 0.0, desired)
+    #   Cars already above v₀ (v₀ just dropped: turn approach, yield cap, rain)
+    #   are NOT snapped down to v₀ — that would be unbounded deceleration.
+    #   They brake through the IDM term, whose output is bounded at −3b, and
+    #   are only prevented from undershooting v₀.
+    _v_new = speed + accel * float(dt)
+    speed = np.where(speed > desired,
+                     np.maximum(_v_new, desired),
+                     np.minimum(_v_new, desired))
+    speed = np.maximum(speed, 0.0)
     speed[at_stopline] = 0.0
 
     # ── Step 6: Position advance + edge crossings ─────────────────────────────
@@ -817,6 +844,31 @@ def idm_tick(
                 and not _tl.can_enter(_pidx)):
             _can_enter[_pidx] = False
     _tl_blocked = ~_can_enter[np.clip(edge_idx, 0, n_paths - 1)]
+
+    # A car stopped in a spillback queue is stuck for the same legitimate
+    # reason as one right at the stop line, even though ITS OWN edge isn't
+    # the one the light controls — only the front of the queue is. Extend
+    # the exemption a few edges upstream from any currently-red path, but
+    # only bother checking cars that are actually stopped without already
+    # being directly exempt (typically a small set), to keep this cheap.
+    _SPILLBACK_HOPS = 3
+    _stopped_not_tl = (speed < _STUCK_SPEED_MS) & (gap < _STUCK_GAP_M) & ~_tl_blocked
+    if np.any(_stopped_not_tl):
+        _blocked_paths = set(np.flatnonzero(~_can_enter).tolist())
+        if _blocked_paths:
+            for _ci in np.flatnonzero(_stopped_not_tl):
+                _frontier = {int(edge_idx[_ci])}
+                for _ in range(_SPILLBACK_HOPS):
+                    if _frontier & _blocked_paths:
+                        _tl_blocked[_ci] = True
+                        break
+                    _nxt: set[int] = set()
+                    for _q in _frontier:
+                        if _q < n_next:
+                            _nxt.update(int(x) for x in car_next_edges[_q])
+                    if not _nxt:
+                        break
+                    _frontier = _nxt
 
     stopped_mask = (speed < _STUCK_SPEED_MS) & (gap < _STUCK_GAP_M) & ~_tl_blocked
     stuck_time[stopped_mask]  += float(dt)

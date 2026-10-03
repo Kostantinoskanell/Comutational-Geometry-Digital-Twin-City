@@ -168,6 +168,19 @@ class CyclistMixin:
             self.street_graph
         )
 
+        # traffic_lights_dict's green_groups/controlled_paths are indices into
+        # car_paths — reusing that dict as-is for cyclists (a different path
+        # list) stops/releases them at whatever car path happens to share the
+        # same integer index, which is essentially random. Build a bearing-
+        # matched view of the same light FSMs instead (see
+        # traffic_lights.build_external_light_views).
+        self.cyclist_traffic_lights_dict = {}
+        if getattr(self, "traffic_lights_dict", None) and self.cyclist_paths:
+            from traffic_lights import build_external_light_views
+            self.cyclist_traffic_lights_dict = build_external_light_views(
+                self.street_graph, self.cyclist_paths, self.traffic_lights_dict,
+            )
+
         if not self.cyclist_paths:
             print("[cyclists] no cycle edges — cyclists disabled")
             self.cyclist_anim: dict = {"enabled": False}
@@ -260,7 +273,7 @@ class CyclistMixin:
             car_anim             = self.cyclist_anim,
             car_paths            = self.cyclist_paths,
             car_next_edges       = self.cyclist_next_edges,
-            traffic_lights       = self.traffic_lights_dict,
+            traffic_lights       = self.cyclist_traffic_lights_dict,
             dt                   = dt,
             params               = self.cyclist_idm_params,
             rng                  = self.cyclist_rng,

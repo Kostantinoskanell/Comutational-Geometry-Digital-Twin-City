@@ -384,10 +384,14 @@ class RouteMixin:
                     f"time={_s['travel_time_s']:.1f}s, mech={_s['mechanical_J']:.1f}J, "
                     f"solar={_s['solar_J']:.1f}J, net={_s['net_energy_J']:.1f}J"
                 )
-                self._update_route_stats_overlay(_summary)
-                if self.route_state.get("selected_car_idx") is not None and len(_joint_nodes) >= 2:
-                    self._assign_selected_car_route(_joint_nodes)
-                self._update_pareto_chart(_g_cost, _src, _tgt)
+
+            # Once per call, with the FULLY populated summary — these three
+            # used to be indented inside the loop above and ran (redundantly,
+            # on partial data) once per route spec instead of once overall.
+            self._update_route_stats_overlay(_summary)
+            if self.route_state.get("selected_car_idx") is not None and len(_joint_nodes) >= 2:
+                self._assign_selected_car_route(_joint_nodes)
+            self._update_pareto_chart(_g_cost, _src, _tgt)
 
     def _road_pick_callback(self, point) -> None:
             if point is None or len(point) < 2:
@@ -497,6 +501,19 @@ class RouteMixin:
         self._stage("Rebuilding traffic and arrows...")
         self.car_paths, self.car_outgoing = self._extract_drivable_paths(self.street_graph, z_level=0.5)
         self.car_path_lengths = np.asarray([float(p["length"]) for p in self.car_paths], dtype=float)
+
+        # demand_mixin._route_to_edges looks up (u,v) -> car_paths INDEX via
+        # this map. car_paths was just rebuilt from scratch above (edges
+        # inserted/removed/reordered by whatever editor op triggered this
+        # rebuild), so the old map's indices now point at wrong-or-nonexistent
+        # edges in the new list — every demand-routed trip planned afterwards
+        # would silently follow a corrupted route. Only demand_mixin.
+        # _init_demand builds this map in the first place, so only rebuild it
+        # here if demand is actually in use.
+        if getattr(self, "demand", None) is not None:
+            self._demand_edge_map = {}
+            for _i, _p in enumerate(self.car_paths):
+                self._demand_edge_map.setdefault((_p.get("u"), _p.get("v")), _i)
         self.adj_left_paths  = np.array([p.get("adjacent_left_path",  -1) for p in self.car_paths], dtype=np.int64)
         self.adj_right_paths = np.array([p.get("adjacent_right_path", -1) for p in self.car_paths], dtype=np.int64)
 

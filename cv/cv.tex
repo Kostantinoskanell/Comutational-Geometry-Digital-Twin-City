@@ -1,0 +1,256 @@
+\documentclass[10pt, a4paper]{article}
+
+% --- PACKAGES ---
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage[left=1.2cm, right=1.2cm, top=1cm, bottom=1cm]{geometry}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fontawesome5}
+\usepackage{tabularx}
+\usepackage{lmodern}
+\renewcommand{\familydefault}{\sfdefault}
+
+% --- COLORS ---
+\definecolor{primary}{RGB}{20, 60, 120}
+\definecolor{darkgray}{RGB}{60, 60, 60}
+\definecolor{lightgray}{RGB}{120, 120, 120}
+
+% --- SECTION STYLE ---
+\titleformat{\section}
+{\Large\bfseries\color{primary}}
+{}{0em}{}
+[\vspace{-0.5em}\rule{\textwidth}{1pt}]
+\titlespacing{\section}{0pt}{0.7em}{0.5em}
+
+% --- CUSTOM ITEM ---
+\newcommand{\cvitem}[4]{
+    \noindent
+    \begin{tabularx}{\textwidth}{@{}X r@{}}
+        \textbf{#1} & \textcolor{primary}{\textbf{#2}} \\
+        \textit{\textcolor{darkgray}{#3}} & \textcolor{lightgray}{\small #4} \\
+    \end{tabularx}
+    \vspace{2pt}
+}
+
+\hypersetup{colorlinks=true, urlcolor=primary, linkcolor=primary}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2pt}
+\begin{document}
+\pagestyle{empty}
+
+\begin{center}
+{\fontsize{24pt}{24pt}\selectfont\textbf{Konstantinos Kanellopoulos}}\\[0.4em]
+{\large\textcolor{primary}{\textbf{Electrical \& Computer Engineering Student \textbar{} Research Assistant}}}\\[0.7em]
+{\small
+\faMapMarker \ Patras, Greece \hspace{1em}
+\faEnvelope \ \href{mailto:kankonstantinos@gmail.com}{kankonstantinos@gmail.com} \hspace{1em}
+\faGithub \ \href{https://github.com/Kostantinoskanell}{github.com/Kostantinoskanell} \hspace{1em}
+\faPhone \ +30 697 338 0604 \hspace{1em}
+\faLinkedin \ \href{https://www.linkedin.com/in/konstantinos-kanellopoulos-b13a7319a/}{LinkedIn}
+}
+\end{center}
+
+\vspace{0.6em}
+
+\section*{PROFILE}
+
+\textbf{Electrical and Computer Engineering student} and \textbf{Research Assistant in the VVR group} (University of Patras) under Prof.\ Konstantinos Moustakas, with strong interests in
+\textbf{simulation, computer graphics, digital twins, neuromorphic computing, robotics, and AI}. Experienced in building complete \textbf{hardware and software systems}: from physically based real-time renderers and traffic/flood simulation pipelines to robot control, event-driven backends, and cryptographic analysis.
+
+Hands-on with \textbf{Python, C++, Java, Dart, ROS2, VTK/PyVista, NumPy/SciPy, Linux, CAD systems, and modern software engineering workflows} (regression testing, profiling, reproducible pipelines).
+
+\section*{TECHNICAL SKILLS}
+
+\noindent
+\textbf{Programming Languages:}
+Python, C++, Java, Dart, C, SQL, Bash, JavaScript
+
+\vspace{0.1em}\noindent
+\textbf{Graphics \& Geospatial:}
+VTK / PyVista, Physically Based Rendering (PBR), Image-Based Lighting, Post-processing (SSAO, FXAA), GPU Instancing, Procedural Modeling, GIS (OpenStreetMap, Overture Maps, DEM/DTM/nDSM rasters, UTM/EGM2008), Photogrammetry Data, Computational Geometry
+
+\vspace{0.1em}\noindent
+\textbf{Simulation \& Modeling:}
+Digital Twins, Microscopic Traffic Simulation (IDM, SUMO), Hydrodynamic Flood Modeling, Agent-Based Simulation, Air-Quality and Noise Models, Wildfire Spread (Rothermel)
+
+\vspace{0.1em}\noindent
+\textbf{AI \& Reinforcement Learning:}
+Reinforcement Learning (PPO), Spiking Neural Networks (ALIF, R-STDP, e-prop), Imitation Learning (DAgger), Statistical Evaluation, Simulation-Based Training, Control Systems, Physics Simulations
+
+\vspace{0.1em}\noindent
+\textbf{Robotics:}
+ROS2, MuJoCo, Kinematics, LIPM Walking Control, Motion Planning, Robotic Arm Control, Sensor/Actuator Integration
+
+\vspace{0.1em}\noindent
+\textbf{Software Engineering:}
+Git, Linux, Event-Driven Architecture, REST APIs, Object-Oriented Design, Automated Testing (regression-first), Performance Profiling \& Optimization, Real-Time Systems
+
+\vspace{0.1em}\noindent
+\textbf{Engineering \& Hardware:}
+Fusion 360, CAD Design, 3D Printing, Embedded Systems Fundamentals, Optics, Hardware Prototyping
+
+\vspace{0.1em}\noindent
+\textbf{Cybersecurity:}
+Reverse Engineering, Cryptography, XOR Ciphers, Base64 Analysis, Known-Plaintext Attacks
+
+
+\section*{EDUCATION}
+
+\cvitem
+{University of Patras}
+{2022 -- 2027 (Expected)}
+{Department of Electrical and Computer Engineering}
+{Patras, Greece}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Current GPA: \textbf{7.45/10}
+\end{itemize}
+
+\vspace{0.35em}
+
+\cvitem
+{Anavryta Model High School}
+{2019 -- 2022}
+{High School Diploma -- Grade: \textbf{19.7/20}}
+{Athens, Greece}
+
+\section*{PROFESSIONAL EXPERIENCE}
+
+\cvitem
+{VVR Group, University of Patras}
+{2026 -- Present}
+{Research Assistant -- supervised by Prof.\ Konstantinos Moustakas}
+{Patras, Greece}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Developing a \textbf{photoreal digital twin of Beirut} that couples real-time traffic and \textbf{flood} simulation with drone-survey data (see Technical Projects).
+\end{itemize}
+
+\vspace{0.35em}
+
+\cvitem
+{Poradix.gr}
+{Dec 2025 -- May 2026}
+{Junior Software Developer}
+{Remote}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Developed an \textbf{Event Store Manager} for handling customer communication and financial records.
+    \item Designed and implemented \textbf{event-driven backend architecture} for real-time transaction tracking.
+\end{itemize}
+
+\vspace{0.35em}
+
+\cvitem
+{Othisi Educational Center}
+{2023 -- 2025}
+{Exam Supervisor -- ran examinations in strict compliance with regulations}
+{}
+
+\section*{TECHNICAL PROJECTS}
+
+\cvitem
+{Neuromorphic Control for Quadruped Robots}
+{2026}
+{Undergraduate Thesis -- AI-Hub 2026 Competition Submission}
+{\href{https://github.com/Kostantinoskanell/thesis}{GitHub}}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Benchmarked \textbf{spiking neural networks} (ALIF, R-STDP, e-prop) against deep networks for LiDAR navigation of a \textbf{Unitree Go2} quadruped in MuJoCo under distribution shift; designed an \textbf{FPGA co-processor} as a memristor-crossbar analog.
+    \item SNN \textbf{10.4$\times$} cheaper in synaptic operations; to our knowledge the \textbf{first walking Go2 controlled by a spiking network}; statistically rigorous protocol (10 seeds, Holm--Bonferroni).
+\end{itemize}
+
+\vspace{0.35em}
+
+\cvitem
+{Digital Twin City \& Flood Simulation (Beirut)}
+{}
+{Python, VTK, Computational Geometry, GIS, PBR Rendering}
+{\href{https://github.com/Kostantinoskanell/Comutational-Geometry-Digital-Twin-City}{GitHub}}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Real-time city \textbf{digital twin} with microscopic traffic (IDM/SUMO), pedestrians, and public transport, plus safety, air-quality, and noise analyses.
+    \item Integrated \textbf{flood simulation} results and a 5\,cm \textbf{drone survey} (terrain, orthophoto, building heights) into a \textbf{physically based renderer}; 4$\times$ faster frames through GPU instancing.
+\end{itemize}
+
+\vspace{0.35em}
+
+\cvitem
+{Optical Engineering \& Hardware Design}
+{}
+{CAD, 3D Printing, Optics}
+{}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Designed and constructed a custom \textbf{Hadley/Newtonian reflecting telescope} (1\,m focal length, 20\,cm primary mirror) using \textbf{CAD modeling}, \textbf{3D printing}, and precision optical alignment.
+\end{itemize}
+
+\vspace{0.35em}
+
+\cvitem
+{Security Research \& Reverse Engineering}
+{}
+{Python, Cryptography}
+{}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Reverse engineered and decrypted a proprietary mobile game database using \textbf{XOR cipher analysis}, \textbf{Base64 decoding}, and \textbf{known-plaintext attacks}.
+\end{itemize}
+
+\vspace{0.35em}
+
+\cvitem
+{Bipedal Robot Design \& Robotic Arm Control}
+{}
+{Fusion 360, MuJoCo, ROS2, C++}
+{}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Designed a custom \textbf{bipedal robot} in Fusion 360 and simulated it in MuJoCo with \textbf{standing stabilization} and \textbf{walking gait control} via the \textbf{Linear Inverted Pendulum Model (LIPM)}.
+    \item Integrated sensors and actuators through \textbf{ROS2}.
+    \item Developed robotic arm trajectory algorithms:
+    \href{https://github.com/Kostantinoskanell/Robotic-Arm-Trajectory-Generation-University-of-Patras-Exercise}{GitHub}
+\end{itemize}
+
+\vspace{0.35em}
+
+\cvitem
+{Other Software Projects}
+{}
+{C++, AI, Simulation}
+{}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Multiplayer RTS game with custom graphics libraries (\href{https://github.com/Kostantinoskanell/Real-Strategy-Game-Upatras}{GitHub}); ``Enigma'', a Quizdom-style multiplayer platform.
+    \item Wildfire prediction system based on the \textbf{Rothermel fire spread model}.
+\end{itemize}
+
+\section*{ACHIEVEMENTS \& CERTIFICATIONS}
+
+\begin{itemize}[leftmargin=1.2em, itemsep=2pt]
+\item \textbf{EBEC Engineering Competition -- University of Patras:}
+\textbf{2nd place} for a real-time bus tracking platform and dashboard prototype.
+\item \textbf{1st Place}, \textbf{Sumo Robot Competition} of the \textbf{Robotics Club of the University of Patras} (autonomous robot design, build, and programming).
+\item \textbf{Hellenic Mathematical Society:} Qualified in the ``Thales'' and ``Euclid'' national competitions.
+\item \textbf{SAT Score:} 1420
+\item \textbf{Languages:} English (C2 Cambridge Proficiency), German (B2 Goethe)
+\end{itemize}
+
+\section*{VOLUNTEERING}
+
+\cvitem
+{ARCHELON -- Sea Turtle Protection Society of Greece}
+{3 Years}
+{Environmental Volunteer}
+{}
+
+\begin{itemize}[leftmargin=1.2em, topsep=0pt, itemsep=1pt]
+    \item Participated in field operations for the protection of \textit{Caretta caretta} nesting sites and eggs.
+\end{itemize}
+
+\end{document}

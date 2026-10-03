@@ -19,6 +19,47 @@ from spatial_trees import OctreeNode
 from streetlight_ga import build_candidate_grid_points
 from overture_source import build_road_and_sidewalk_meshes_from_graph
 
+
+# ── Robust cache I/O ───────────────────────────────────────────────────────
+_UNPICKLABLE_GRAPH_KEYS = ("terrain_sampler", "terrain_sampler_base")
+
+
+def _atomic_pickle(obj, path: Path) -> None:
+    """Write-then-rename so a failed or interrupted dump can never leave a
+    truncated cache file behind (which crashed the next startup)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _save_graph_cache(street_graph, path: Path) -> None:
+    """Pickle a street graph without its (closure) terrain samplers."""
+    held = {k: street_graph.graph.pop(k) for k in _UNPICKLABLE_GRAPH_KEYS if k in street_graph.graph}
+    try:
+        _atomic_pickle(street_graph, path)
+    finally:
+        street_graph.graph.update(held)
+
+
+def _load_pickle_or_none(path: Path, label: str):
+    """Load a cache pickle; a corrupt/partial file counts as a cache miss."""
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as exc:
+        print(f"[cache] {label} cache {Path(path).name} unreadable ({type(exc).__name__}) — rebuilding")
+        try:
+            Path(path).unlink()
+        except Exception:
+            pass
+        return None
+
 ROAD_BUFFER_M = 3.0
 SIDEWALK_BUFFER_M = 1.5
 ROAD_EXTRUDE_Z = 0.1
@@ -451,10 +492,11 @@ def _load_or_fetch_osm_cached(
 
     water_path = cache_dir / f"osm_{key}_water.vtp"
 
-    if use_cache and mesh_path.exists() and graph_path.exists():
+    _cached_graph = (_load_pickle_or_none(graph_path, "street-graph")
+                     if use_cache and mesh_path.exists() and graph_path.exists() else None)
+    if _cached_graph is not None:
         buildings_mesh = pv.read(mesh_path)
-        with open(graph_path, "rb") as f:
-            street_graph = pickle.load(f)
+        street_graph = _cached_graph
 
         if road_path.exists() and sidewalk_path.exists():
             road_mesh = pv.read(road_path)
@@ -500,8 +542,7 @@ def _load_or_fetch_osm_cached(
             if use_cache:
                 try:
                     cache_dir.mkdir(parents=True, exist_ok=True)
-                    with open(places_path, "wb") as _pf:
-                        pickle.dump(places, _pf)
+                    _atomic_pickle(places, places_path)
                 except Exception as _pe:
                     print(f"[places] cache save failed: {_pe}")
 
@@ -524,8 +565,7 @@ def _load_or_fetch_osm_cached(
                         street_graph.graph["fill_faces"]  = np.asarray(_fill.faces,           dtype=np.int64)
                         street_graph.graph["fill_rgb"]    = np.asarray(_fill.cell_data["RGB"], dtype=np.uint8)
                         street_graph.graph["fill_ver"]   = _FILL_VER
-                        with open(graph_path, "wb") as _gf:
-                            pickle.dump(street_graph, _gf)
+                        _save_graph_cache(street_graph, graph_path)
                         print("[fill] updated graph cache with land-use fill data (palette v2)")
             except Exception as _fe:
                 print(f"[fill] land-use fetch skipped (cached graph): {_fe}")
@@ -591,11 +631,7 @@ def _load_or_fetch_osm_cached(
         road_mesh.save(road_path)
         sidewalk_mesh.save(sidewalk_path)
         
-        _ts = street_graph.graph.pop("terrain_sampler", None)
-        with open(graph_path, "wb") as f:
-            pickle.dump(street_graph, f)
-        if _ts is not None:
-            street_graph.graph["terrain_sampler"] = _ts
+        _save_graph_cache(street_graph, graph_path)
             
         if water_mesh is not None:
             if not isinstance(water_mesh, pv.PolyData):
@@ -604,8 +640,7 @@ def _load_or_fetch_osm_cached(
 
         # Places → disk so cached runs skip the Overture POI fetch entirely
         try:
-            with open(cache_dir / f"osm_{key}_places.pkl", "wb") as _pf:
-                pickle.dump(places, _pf)
+            _atomic_pickle(places, cache_dir / f"osm_{key}_places.pkl")
         except Exception as _pe:
             print(f"[places] cache save failed: {_pe}")
         print(f"Saved OSM cache: {mesh_path.name}")
@@ -678,12 +713,12 @@ def _load_or_build_spatial_cache(
     ground_path = cache_dir / f"spatial_{cache_context_key}_ground.vtp"
     octree_path = cache_dir / f"spatial_{cache_context_key}_octree.pkl"
 
-    if use_cache and ground_path.exists() and octree_path.exists():
+    _oct = (_load_pickle_or_none(octree_path, "octree")
+            if use_cache and ground_path.exists() and octree_path.exists() else None)
+    if _oct is not None:
         ground_mesh = _normalize_ground_mesh(pv.read(ground_path))
-        with open(octree_path, "rb") as f:
-            octree_root = pickle.load(f)
         print(f"Loaded spatial cache: {ground_path.name}")
-        return ground_mesh, octree_root
+        return ground_mesh, _oct
 
     if preferred_ground_mesh is not None and preferred_ground_mesh.n_cells > 0:
         ground_mesh = _normalize_ground_mesh(preferred_ground_mesh.copy())
@@ -698,8 +733,7 @@ def _load_or_build_spatial_cache(
         if not isinstance(ground_mesh, pv.PolyData):
             ground_mesh = ground_mesh.extract_surface()
         ground_mesh.save(ground_path)
-        with open(octree_path, "wb") as f:
-            pickle.dump(octree_root, f)
+        _atomic_pickle(octree_root, octree_path)
         print(f"Saved spatial cache: {ground_path.name}")
 
     return ground_mesh, octree_root

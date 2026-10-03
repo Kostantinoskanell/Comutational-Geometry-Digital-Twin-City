@@ -91,6 +91,14 @@ METERS_PER_FLOOR = 3.5
 # Geocoding helpers
 # ---------------------------------------------------------------------------
 
+# Centre of the Al-Masar Al-Akhdar flood-study domain (UTM 36N terrain_cut_0.5).
+PLACE_PRESETS = {
+    "beirut corridor": (33.894392, 35.522659),
+    "al-masar corridor": (33.894392, 35.522659),
+    "al-masar al-akhdar": (33.894392, 35.522659),
+}
+
+
 def _geocode_address(address: str) -> tuple[float, float]:
     """Return (lat, lon) for a free-text address via Nominatim.
 
@@ -99,7 +107,16 @@ def _geocode_address(address: str) -> tuple[float, float]:
     """
     import hashlib
     import json
+    import re
     from pathlib import Path
+
+    # Literal coordinates ("33.8944, 35.5227") and named presets need no network.
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*[,;]\s*(-?\d+(?:\.\d+)?)\s*$", address or "")
+    if m and abs(float(m.group(1))) <= 90.0 and abs(float(m.group(2))) <= 180.0:
+        return float(m.group(1)), float(m.group(2))
+    preset = PLACE_PRESETS.get((address or "").strip().lower())
+    if preset is not None:
+        return preset
 
     cache_dir = Path(__file__).resolve().parent / "cache"
     key = hashlib.sha1(address.strip().lower().encode("utf-8")).hexdigest()[:16]
@@ -1493,6 +1510,7 @@ def build_3d_buildings_and_street_graph(
             })
 
     # 8. Hybrid: Fetch parks and parking from OSM
+    from osm_net import with_overpass_fallback as _ovp
     try:
         import osmnx as ox
         import geopandas as gpd
@@ -1504,7 +1522,7 @@ def build_3d_buildings_and_street_graph(
         park_tags = {"leisure": "park", "landuse": ["grass", "meadow", "recreation_ground", "village_green"]}
         try:
             print("[Overture/OSM] Fetching parks via Overpass API...")
-            parks: gpd.GeoDataFrame = ox.features_from_point(center, tags=park_tags, dist=radius)
+            parks: gpd.GeoDataFrame = _ovp(lambda: ox.features_from_point(center, tags=park_tags, dist=radius))
             projected_parks = parks.to_crs(proj_str) if not parks.empty else gpd.GeoDataFrame()
         except Exception:
             projected_parks = gpd.GeoDataFrame()
@@ -1512,7 +1530,7 @@ def build_3d_buildings_and_street_graph(
         parking_tags = {"amenity": "parking"}
         try:
             print("[Overture/OSM] Fetching parking via Overpass API...")
-            parking: gpd.GeoDataFrame = ox.features_from_point(center, tags=parking_tags, dist=radius)
+            parking: gpd.GeoDataFrame = _ovp(lambda: ox.features_from_point(center, tags=parking_tags, dist=radius))
             projected_parking = parking.to_crs(proj_str) if not parking.empty else gpd.GeoDataFrame()
         except Exception:
             projected_parking = gpd.GeoDataFrame()
@@ -1585,7 +1603,7 @@ def build_3d_buildings_and_street_graph(
         # Fetch traffic signals and stop signs from OSM and map to nearest Overture graph node
         ts_tags = {"highway": ["traffic_signals", "stop"]}
         try:
-            ts: gpd.GeoDataFrame = ox.features_from_point(center, tags=ts_tags, dist=radius)
+            ts: gpd.GeoDataFrame = _ovp(lambda: ox.features_from_point(center, tags=ts_tags, dist=radius))
             if not ts.empty:
                 ts_projected = ts.to_crs(proj_str)
                 # For each control, find nearest Overture node
@@ -1620,7 +1638,7 @@ def build_3d_buildings_and_street_graph(
         # Pedestrian crossings from OSM
         crossing_tags = {"highway": "crossing"}
         try:
-            cross_gdf: gpd.GeoDataFrame = ox.features_from_point(center, tags=crossing_tags, dist=radius)
+            cross_gdf: gpd.GeoDataFrame = _ovp(lambda: ox.features_from_point(center, tags=crossing_tags, dist=radius))
             if not cross_gdf.empty:
                 cross_proj = cross_gdf.to_crs(proj_str)
                 _emids: list = []

@@ -86,51 +86,27 @@ class CarMixin:
         _hour = float(self.scene_state.get("hour", 12.0))
         _effective_speed = float(self.args.traffic_speed) * _rush_hour_multiplier(_hour)
 
-        # Pedestrian crosswalk yield: cars within 12 m of an active crossing
-        # are temporarily speed-capped to walking pace for this tick.
-        _yield_idx = None
-        _saved_desired: np.ndarray | None = None
-        _crossing_pts = getattr(self, "ped_anim", {}).get("active_crossings", [])
-        if _crossing_pts and bool(self.car_anim.get("enabled")):
-            _pos = np.asarray(self.car_anim.get("pos", []), dtype=float)
-            if _pos.shape[0] > 0:
-                try:
-                    from scipy.spatial import cKDTree as _CKT
-                    _ct = _CKT(np.array(_crossing_pts, dtype=float))
-                    _dists, _ = _ct.query(_pos[:, :2])
-                    _near = _dists < 12.0
-                    if np.any(_near):
-                        _yield_idx = np.where(_near)[0]
-                        _saved_desired = self.car_anim["desired_speed"][_yield_idx].copy()
-                        self.car_anim["desired_speed"][_yield_idx] = np.minimum(
-                            self.car_anim["desired_speed"][_yield_idx], 1.4
-                        )
-                except Exception:
-                    pass
-
-        # Emergency vehicle clearance: cars within 30 m slow to near-stop
-        _em_yield_idx = None
-        _em_saved_desired: np.ndarray | None = None
-        _em_positions = (
-            self._em_active_positions()
-            if hasattr(self, "_em_active_positions") else []
-        )
-        if _em_positions and bool(self.car_anim.get("enabled")):
-            _car_pos = np.asarray(self.car_anim.get("pos", []), dtype=float)
-            if _car_pos.shape[0] > 0:
-                try:
-                    from scipy.spatial import cKDTree as _CKT2
-                    _em_pts = np.array([p[:2] for p in _em_positions], dtype=float)
-                    _em_d, _ = _CKT2(_em_pts).query(_car_pos[:, :2])
-                    _em_near = _em_d < 30.0
-                    if np.any(_em_near):
-                        _em_yield_idx = np.where(_em_near)[0]
-                        _em_saved_desired = self.car_anim["desired_speed"][_em_yield_idx].copy()
-                        self.car_anim["desired_speed"][_em_yield_idx] = np.minimum(
-                            self.car_anim["desired_speed"][_em_yield_idx], 0.5
-                        )
-                except Exception:
-                    pass
+        # Per-car speed ceiling for this tick, passed to idm_tick as speed_cap:
+        # walking pace within 12 m of an active pedestrian crossing, near-stop
+        # within 30 m of an emergency vehicle.
+        _cap = None
+        _pos = np.asarray(self.car_anim.get("pos", []), dtype=float)
+        if bool(self.car_anim.get("enabled")) and _pos.ndim == 2 and _pos.shape[0] > 0:
+            from scipy.spatial import cKDTree as _CKT
+            _crossing_pts = getattr(self, "ped_anim", {}).get("active_crossings", [])
+            if _crossing_pts:
+                _d, _ = _CKT(np.asarray(_crossing_pts, dtype=float)[:, :2]).query(_pos[:, :2])
+                if np.any(_d < 12.0):
+                    _cap = np.full(_pos.shape[0], np.inf)
+                    _cap[_d < 12.0] = 1.4
+            _em_positions = self._em_active_positions() if hasattr(self, "_em_active_positions") else []
+            if _em_positions:
+                _em_pts = np.array([p[:2] for p in _em_positions], dtype=float)
+                _d, _ = _CKT(_em_pts).query(_pos[:, :2])
+                if np.any(_d < 30.0):
+                    if _cap is None:
+                        _cap = np.full(_pos.shape[0], np.inf)
+                    _cap[_d < 30.0] = np.minimum(_cap[_d < 30.0], 0.5)
 
         idm_tick(
             car_anim       = self.car_anim,
@@ -144,13 +120,8 @@ class CarMixin:
             roundabout_yield_map = self.roundabout_yield_map,
             adj_left  = getattr(self, "adj_left_paths",  None),
             adj_right = getattr(self, "adj_right_paths", None),
+            speed_cap = _cap,
         )
-
-        # Restore desired speeds so IDM accelerates back on the next clear tick
-        if _yield_idx is not None and _saved_desired is not None:
-            self.car_anim["desired_speed"][_yield_idx] = _saved_desired
-        if _em_yield_idx is not None and _em_saved_desired is not None:
-            self.car_anim["desired_speed"][_em_yield_idx] = _em_saved_desired
 
         # Gravity O-D demand: re-trip cars that have arrived (throttled).
         if getattr(self, "demand", None) is not None:
@@ -485,6 +456,7 @@ class CarMixin:
                         _INTER_CLEARANCE = 20.0
 
                         _placed = 0
+                        _p_pos, _p_hdg, _p_mid, _p_col = [], [], [], []
                         for _pi in self.car_rng.permutation(len(_sample_pts)):
                             if _placed >= target_parked:
                                 break
@@ -494,29 +466,19 @@ class CarMixin:
                                 if _d_inter < _INTER_CLEARANCE:
                                     continue
                             mid = int(self.car_rng.integers(0, len(self.car_obj_templates)))
-                            tmpl = self.car_obj_templates[mid]
-                            color = self._CAR_BODY_COLORS[mid % len(self._CAR_BODY_COLORS)]
-                            if isinstance(tmpl, list):
-                                import vtk
-                                _assembly = vtk.vtkAssembly()
-                                for _poly, _prop, _tex in tmpl:
-                                    _mapper = vtk.vtkPolyDataMapper()
-                                    _mapper.SetInputData(_poly)
-                                    _part_act = vtk.vtkActor()
-                                    _part_act.SetMapper(_mapper)
-                                    _part_act.SetProperty(_prop)
-                                    if _tex: _part_act.SetTexture(_tex)
-                                    _assembly.AddPart(_part_act)
-                                self.plotter.add_actor(_assembly)
-                                _actor = _assembly
-                            else:
-                                _actor = self.plotter.add_mesh(tmpl.copy(), color=color, smooth_shading=True, lighting=True, reset_camera=False)
-                            _actor.SetPosition(px_off, py_off, rz)
-                            _actor.SetOrientation(0.0, 0.0, heading)
-                            parked_actors.append(_actor)
+                            _p_pos.append((px_off, py_off, rz))
+                            _p_hdg.append(heading)
+                            _p_mid.append(mid)
+                            _p_col.append(self._CAR_BODY_COLORS[mid % len(self._CAR_BODY_COLORS)])
                             _placed += 1
+                        if _placed:
+                            # One instanced draw per car model (render.instanced_cars)
+                            from render.instanced_cars import InstancedFleet
+                            self.scene_state["_parked_fleet"] = InstancedFleet(
+                                self.plotter, self.car_obj_templates, _p_mid,
+                                [pv.Color(c).int_rgb for c in _p_col], _p_pos, _p_hdg)
                         self.scene_state["_parked_car_actors"] = parked_actors
-                        print(f"[cars] created {len(parked_actors)} parked cars")
+                        print(f"[cars] created {_placed} parked cars (instanced)")
                     except Exception as e:
                         print(f"[cars] Failed to create parked cars: {e}")
 
@@ -539,6 +501,10 @@ class CarMixin:
                 except Exception:
                     pass
             self.scene_state["_parked_car_actors"] = None
+            for _fk in ("_ultra_fleet", "_parked_fleet"):
+                _fl = self.scene_state.pop(_fk, None)
+                if _fl is not None:
+                    _fl.remove()
 
             return
 
@@ -555,81 +521,30 @@ class CarMixin:
         # ── Ultra mode: per-car OBJ mesh actors ─────────────────────────
         if self.args.car_detail == "ultra" and self.car_obj_templates:
             headings = self._sample_car_headings()
-            ultra_actors = self.scene_state.get("_ultra_car_actors")
-
-            if not ultra_actors:
-                # First call — create one actor per car from its assigned template
+            fleet = self.scene_state.get("_ultra_fleet")
+            if fleet is None or fleet.n != positions.shape[0]:
+                if fleet is not None:
+                    fleet.remove()
+                # One instanced draw per car model instead of one actor per car
+                from render.instanced_cars import InstancedFleet
                 n = positions.shape[0]
                 model_idx = np.asarray(self.car_anim.get("model_idx", np.zeros(n, dtype=np.int64)), dtype=np.int64)
-                ultra_actors = []
+                model_idx = (model_idx[:n] if model_idx.shape[0] >= n
+                             else np.resize(model_idx, n)) % len(self.car_obj_templates)
+                colours = []
                 for i in range(n):
-                    mid = int(model_idx[i]) % len(self.car_obj_templates)
-                    tmpl = self.car_obj_templates[mid]
-                    if self.car_solar_model_idx is not None and mid == self.car_solar_model_idx:
-                        color = self._SOLAR_CAR_COLOR
+                    if self.car_solar_model_idx is not None and int(model_idx[i]) == self.car_solar_model_idx:
+                        colours.append(pv.Color(self._SOLAR_CAR_COLOR).int_rgb)
                     else:
-                        color = self._CAR_BODY_COLORS[i % len(self._CAR_BODY_COLORS)]
-                    try:
-                        if isinstance(tmpl, list):
-                            import vtk
-                            _assembly = vtk.vtkAssembly()
-                            for _poly, _prop, _tex in tmpl:
-                                _mapper = vtk.vtkPolyDataMapper()
-                                _mapper.SetInputData(_poly)
-                                _part_act = vtk.vtkActor()
-                                _part_act.SetMapper(_mapper)
-                                _part_act.SetProperty(_prop)
-                                if _tex:
-                                    _part_act.SetTexture(_tex)
-                                _assembly.AddPart(_part_act)
-                            self.plotter.add_actor(_assembly)
-                            _actor = _assembly
-                        else:
-                            _actor = self.plotter.add_mesh(
-                                tmpl.copy(),
-                                color=color,
-                                smooth_shading=True,
-                                lighting=True,
-                                reset_camera=False,
-                            )
-                        _actor.SetPosition(
-                            float(positions[i, 0]),
-                            float(positions[i, 1]),
-                            float(positions[i, 2]),
-                        )
-                        _actor.SetOrientation(0.0, 0.0, float(headings[i]))
-                        ultra_actors.append(_actor)
-                    except Exception as _exc:
-                        print(f"[cars] OBJ actor {i} creation failed: {_exc}")
-                self.scene_state["_ultra_car_actors"] = ultra_actors
-                print(f"[cars] created {len(ultra_actors)} OBJ car actors")
+                        colours.append(pv.Color(self._CAR_BODY_COLORS[i % len(self._CAR_BODY_COLORS)]).int_rgb)
+                fleet = InstancedFleet(self.plotter, self.car_obj_templates, model_idx, colours,
+                                       positions, headings)
+                self.scene_state["_ultra_fleet"] = fleet
+                self.scene_state["_ultra_car_actors"] = fleet.actors
+                print(f"[cars] created {n} OBJ cars as {len(fleet.actors)} instanced draw(s)")
             else:
-                # Subsequent calls — update transform only (no add_mesh)
-                _last_h = self.scene_state.get("_ultra_car_headings")
-                if not isinstance(_last_h, np.ndarray) or _last_h.shape[0] != positions.shape[0]:
-                    _last_h = np.full(positions.shape[0], np.nan, dtype=float)
-                for i, _actor in enumerate(ultra_actors):
-                    if i >= positions.shape[0]:
-                        break
-                    try:
-                        _actor.SetPosition(
-                            float(positions[i, 0]),
-                            float(positions[i, 1]),
-                            float(positions[i, 2]),
-                        )
-                        h = float(headings[i])
-                        if not np.isfinite(_last_h[i]) or abs(h - float(_last_h[i])) > 2.0:
-                            _actor.SetOrientation(0.0, 0.0, h)
-                            _last_h[i] = h
-                    except Exception as _exc:
-                        if not getattr(self, "_render_cars_vtk_warned", False):
-                            print(f"[cars] VTK transform update failed: {_exc}")
-                            self._render_cars_vtk_warned = True
-                self.scene_state["_ultra_car_headings"] = _last_h
-
-            show = bool(self.scene_state["show_cars"])
-            for _actor in ultra_actors:
-                self._set_actor_visibility(_actor, show)
+                fleet.update(positions, headings)
+            fleet.set_visible(bool(self.scene_state["show_cars"]))
         else:
             # ── Standard/low-detail: GlyphInstances with oriented car-box ────────
             from glyph_instance import GlyphInstances as _GlyphInstances

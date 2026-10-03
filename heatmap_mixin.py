@@ -36,10 +36,12 @@ _POLLUTANT_LABEL = {
 # Build custom RGBA cmap once at import time so we don't depend on matplotlib
 # being available at the call site.  256-step lookup: RGBA float [0,1].
 try:
-    import matplotlib.cm as _mcm
     import matplotlib.colors as _mc
+    import matplotlib.pyplot as _mplt
 
-    _base_vals = _mcm.get_cmap("RdYlGn_r", 256)(np.linspace(0.0, 1.0, 256))
+    # matplotlib.cm.get_cmap was removed in matplotlib>=3.9; plt.get_cmap
+    # (or matplotlib.colormaps[name]) is the surviving API.
+    _base_vals = _mplt.get_cmap("RdYlGn_r", 256)(np.linspace(0.0, 1.0, 256))
     # Alpha ramp: 0 for the lowest 8 % of the range, then 0 → 0.65
     _alphas = np.clip(np.linspace(-0.12, 0.70, 256), 0.0, 0.70)
     _base_vals[:, 3] = _alphas

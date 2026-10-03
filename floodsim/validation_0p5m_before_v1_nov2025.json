@@ -1,0 +1,15 @@
+{
+ "flooded_ha_live": 5.61765,
+ "flooded_ha_ref": 4.99085,
+ "iou": 0.8595173510839224,
+ "corr": 0.9473241564508978,
+ "outflow_live": 2775.414038390056,
+ "outflow_ref": 2487.96,
+ "stored_live": 9633.99556446854,
+ "stored_ref": 9925.71,
+ "infil_live": 644.6155971390962,
+ "infil_ref": 639.5,
+ "wall_s": 2248.67,
+ "iters": 71351,
+ "iters_ref": 45828
+}

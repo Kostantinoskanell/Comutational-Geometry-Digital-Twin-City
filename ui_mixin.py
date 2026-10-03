@@ -8,6 +8,7 @@ from solar_routing import nearest_graph_node, find_pareto_routes, build_edge_cos
 from traffic_lights import build_traffic_lights as _build_traffic_lights
 from streetlight_ga import optimize_streetlights, build_sidewalk_polygon_from_street_graph, _smart_light_positions
 from editor_ops import reverse_edge, insert_roundabout
+from vtk_timers import add_timer
 
 
 class UIMixin:
@@ -32,10 +33,38 @@ class UIMixin:
                 except Exception:
                     pass
             self.scene_state.pop("_bridge_start", None)
+        # Cancel any in-progress stairs placement when leaving stairs mode
+        # (own state keys/marker name — kept separate from the highway/bridge
+        # ones above so switching directly between the two two-click tools
+        # can never leak a half-finished pick from one into the other).
+        if mode != "stairs":
+            _pending_stairs_mk = self.scene_state.pop("_stairs_start_actor", None)
+            if _pending_stairs_mk is not None:
+                try:
+                    self.plotter.remove_actor("stairs_start_marker")
+                except Exception:
+                    pass
+            self.scene_state.pop("_stairs_start", None)
+        # Cancel any in-progress greenspace polygon when leaving that mode
+        if mode != "greenspace":
+            _gs_pts = self.scene_state.pop("_greenspace_pts", None)
+            if _gs_pts:
+                try:
+                    self.plotter.remove_actor("greenspace_preview")
+                except Exception:
+                    pass
+        if mode != "strip":
+            if self.scene_state.pop("_strip_pts", None):
+                try:
+                    self.plotter.remove_actor("strip_preview")
+                except Exception:
+                    pass
         # key '7' belongs to scenario-save-A; 'g' = buildings, 'y' = highway
         mode_keys = [("1", "view"), ("2", "roads"), ("3", "roundabouts"),
                      ("4", "lights"), ("5", "stops"), ("6", "streetlights"),
-                     ("g", "buildings"), ("y", "highway")]
+                     ("g", "buildings"), ("y", "highway"),
+                     ("l", "trees"), ("j", "greenspace"), ("k", "stairs"),
+                     ("S", "strip"), ("D", "drains")]
         text = "  |  ".join(f"[{k}] {m.capitalize()}" for k, m in mode_keys)
         self.plotter.add_text(f"Mode: {mode.upper()}   |   {text}", position=(10, 10), name="editor_mode_overlay", font_size=12, color="white")
         print(f"[editor] Switched to mode: {mode}")
@@ -90,6 +119,21 @@ class UIMixin:
             except Exception:
                 pass
             self.scene_state.pop(_name, None)   # drop drape registration too
+            # User-placed trees register a seed/template/kwargs entry (keyed
+            # by the actor name minus its "_tree_" prefix) so the terrain
+            # drape toggle can re-lift them alongside the OSM trees — undo
+            # must drop those too or a stale seed re-glyphs a "ghost" tree
+            # the next time terrain draping is applied.
+            if _name.startswith("_tree_"):
+                _tkey = _name[len("_tree_"):]
+                for _d in (self.scene_state.get("_tree_seeds_flat"),
+                           self.scene_state.get("_tree_templates"),
+                           self.scene_state.get("_tree_actor_kwargs")):
+                    if _d is not None:
+                        _d.pop(_tkey, None)
+
+        if hasattr(self, "_design_sync_after_undo"):
+            self._design_sync_after_undo()
 
         # Building op: restore the mesh, rebuild the octree, refresh shadows
         if entry.get("bmesh") is not None:
@@ -113,6 +157,173 @@ class UIMixin:
 
         self._defer_editor_work(_do_undo_rebuild)
 
+    def _add_tree_at(self, px: float, py: float) -> None:
+        """Place a single tree (trunk + canopy glyph) at (px, py), '[l]' mode.
+
+        Mirrors the OSM tree glyph mechanism built at startup
+        (main_ast6.py, "Trees from OSM" block): each glyph group is a flat
+        (z=0/z=5) seed-point PolyData registered in
+        scene_state["_tree_seeds_flat"/"_tree_templates"/"_tree_actor_kwargs"]
+        under a name so the terrain-drape toggle can re-lift it later.  A
+        user tree gets its OWN key/actor pair (not merged into the shared
+        "osm_trunk"/"osm_canopy_*" arrays) so a single 'o' undo removes only
+        that tree, not the whole OSM canopy.
+        """
+        _bz = 0.0
+        if self.scene_state.get("_terrain_drape_active"):
+            try:
+                _dem = self.street_graph.graph.get("terrain_sampler")
+                if _dem is not None:
+                    _bz = float(np.asarray(_dem(np.array([[px, py]])), dtype=float)[0])
+            except Exception:
+                pass
+
+        _n = int(self.scene_state.get("_user_tree_count", 0)) + 1
+        self.scene_state["_user_tree_count"] = _n
+        from render.trees import add_tree_groups, tree_keys
+        _prefix = f"user{_n}"
+        _trunk_key, _canopy_key = tree_keys(_prefix, px, py)
+
+        _undo = self._editor_push_undo(f"tree @ ({px:.0f}, {py:.0f})")
+        _undo["actors"].extend([f"_tree_{_trunk_key}", f"_tree_{_canopy_key}"])
+        add_tree_groups(self.plotter, self.scene_state, _prefix, np.array([[px, py]]), base_z=_bz)
+        if getattr(self, "flood_lab", None) is not None:
+            from floodsim.model import DesignObject
+            self._design_add(DesignObject(key=f"_tree_{_trunk_key}", kind="tree", geom=np.array([[px, py]]),
+                                          aux=(f"_tree_{_canopy_key}",), label="tree"))
+        print(f"[editor] Tree #{_n} placed at ({px:.0f}, {py:.0f})  ('o' to undo)")
+
+    def _finalize_greenspace(self) -> None:
+        """[Return] in 'greenspace' mode: close the polygon and fill it in.
+
+        Needs >= 3 accumulated points (see the "greenspace" branch of
+        _unified_pick_callback); does nothing otherwise so a stray Return
+        press is harmless.
+        """
+        if self.scene_state.get("editor_mode") == "strip":
+            return self._finalize_strip()
+        pts = self.scene_state.get("_greenspace_pts") or []
+        if len(pts) < 3:
+            print(f"[editor] Greenspace: need >= 3 points to finish "
+                  f"(have {len(pts)}) — keep clicking or 'j' to cancel")
+            return
+        try:
+            from editor_ops import make_greenspace_polygon
+            arr = np.asarray(pts, dtype=float)
+
+            # Built FLAT just above the photo ground (0.18); the terrain drape lifts it with the
+            # ground it covers (_drape_over_ground), exactly like the flood layers.
+            mesh = self._refine_for_drape(make_greenspace_polygon(arr, base_z=0.215))
+
+            _undo = self._editor_push_undo(f"greenspace ({len(pts)} pts)")
+            _n = int(self.scene_state.get("_user_greenspace_count", 0)) + 1
+            self.scene_state["_user_greenspace_count"] = _n
+            _gname = f"user_greenspace_{_n}"
+            _undo["actors"].append(_gname)
+            _cls, _col = self._lab_current_material()
+            self.scene_state[_gname] = self.plotter.add_mesh(
+                mesh, color=_col, opacity=0.92, show_edges=False,
+                lighting=True, reset_camera=False, name=_gname,
+            )
+            self._design_register_area(_gname, arr, _cls)
+            self._drape_user_layer(_gname)
+
+            try:
+                self.plotter.remove_actor("greenspace_preview")
+            except Exception:
+                pass
+            self.scene_state.pop("_greenspace_pts", None)
+            self._walk_hud("")
+            print(f"[editor] Greenspace placed: {len(pts)} points  ('o' to undo)")
+        except Exception as exc:
+            import traceback
+            print(f"[editor] Greenspace finalize failed: {exc}")
+            traceback.print_exc()
+
+    @staticmethod
+    def _refine_for_drape(mesh, max_edge_m: float = 3.0):
+        """Split long edges so a draped polygon follows the terrain instead of
+        spanning it as a chord (a 160 m strip has only 4 corners otherwise)."""
+        try:
+            m = mesh.triangulate()
+            out = m.subdivide_adaptive(max_edge_len=max_edge_m, max_n_tris=80000)
+            return out if out.n_cells else m
+        except Exception:
+            return mesh
+
+    def _drape_user_layer(self, key: str) -> None:
+        """A user-drawn flat layer (area / strip / drain) built just above the photo ground:
+        lift it onto the draped ground it covers if terrain draping is already on."""
+        if self.scene_state.get("_terrain_drape_active"):
+            _dem = self.street_graph.graph.get("terrain_sampler")
+            if _dem is not None and hasattr(self, "_drape_over_ground"):
+                self._drape_over_ground(key, _dem)
+
+    def _lab_current_material(self) -> tuple[int, str]:
+        """(material class, colour) selected in the Flood Lab (garden when the lab is off)."""
+        lab = getattr(self, "flood_lab", None)
+        if lab is None:
+            return 5, "#3a9d4a"
+        from flood_lab_mixin import MATERIAL_CYCLE
+        return MATERIAL_CYCLE[lab["material_idx"]]
+
+    def _design_register_area(self, key: str, xy, cls: int, label: str = "") -> None:
+        if getattr(self, "flood_lab", None) is None:
+            return
+        from floodsim.model import DesignObject
+        self._design_add(DesignObject(key=key, kind="area", cls=int(cls), geom=np.asarray(xy, float), label=label))
+
+    def _finalize_strip(self) -> None:
+        pts = self.scene_state.get("_strip_pts") or []
+        if len(pts) < 2:
+            print("[editor] Strip: need >= 2 points")
+            return
+        try:
+            from shapely.geometry import LineString
+            from editor_ops import make_greenspace_polygon
+            from flood_lab_mixin import STRIP_WIDTHS_M
+            lab = getattr(self, "flood_lab", None)
+            width = STRIP_WIDTHS_M[lab["strip_idx"]] if lab is not None else 3.0
+            poly = LineString(pts).buffer(width / 2.0, cap_style=2, join_style=2)
+            ring = np.asarray(poly.exterior.coords)[:-1]
+            mesh = self._refine_for_drape(make_greenspace_polygon(ring, base_z=0.215))
+            _undo = self._editor_push_undo(f"strip ({len(pts)} pts, {width:.1f} m)")
+            _n = int(self.scene_state.get("_user_strip_count", 0)) + 1
+            self.scene_state["_user_strip_count"] = _n
+            _name = f"user_strip_{_n}"
+            _undo["actors"].append(_name)
+            _cls, _col = self._lab_current_material()
+            self.scene_state[_name] = self.plotter.add_mesh(mesh, color=_col, opacity=0.92, lighting=True,
+                                                            reset_camera=False, name=_name)
+            self._design_register_area(_name, ring, _cls, "strip")
+            self._drape_user_layer(_name)
+            try:
+                self.plotter.remove_actor("strip_preview")
+            except Exception:
+                pass
+            self.scene_state.pop("_strip_pts", None)
+            self._walk_hud("")
+            print(f"[editor] Strip placed: {len(pts)} points, {width:.1f} m wide ('o' to undo)")
+        except Exception as exc:
+            import traceback
+            print(f"[editor] Strip finalize failed: {exc}")
+            traceback.print_exc()
+
+    def _add_drain_at(self, px: float, py: float) -> None:
+        """Storm-drain inlet: a grate marker + a sink in the flood solver."""
+        _undo = self._editor_push_undo(f"drain @ ({px:.0f}, {py:.0f})")
+        _n = int(self.scene_state.get("_user_drain_count", 0)) + 1
+        self.scene_state["_user_drain_count"] = _n
+        _name = f"user_drain_{_n}"
+        _undo["actors"].append(_name)
+        grate = pv.Cylinder(center=(px, py, 0.26), direction=(0, 0, 1), radius=0.9, height=0.12, resolution=16)
+        self.scene_state[_name] = self.plotter.add_mesh(grate, color="#2b3a55", lighting=True, reset_camera=False, name=_name)
+        self._drape_user_layer(_name)
+        if getattr(self, "flood_lab", None) is not None:
+            from floodsim.model import DesignObject
+            self._design_add(DesignObject(key=_name, kind="drain", geom=np.array([[px, py]]), label="drain"))
+        print(f"[editor] Storm drain #{_n} at ({px:.0f}, {py:.0f}) ('o' to undo)")
+
     def _defer_editor_work(self, fn) -> None:
         """Run heavy editor work AFTER the pick event finishes.
 
@@ -131,9 +342,10 @@ class UIMixin:
             # the panel checkbox once the scene is stable.
             _ssao_was_on = False
             try:
-                _ssao_was_on = bool(self.renderer.GetUseSSAO())
+                _ssao_was_on = self._postfx_ssao_on()
                 if _ssao_was_on:
-                    self.renderer.SetUseSSAO(False)
+                    if not self._postfx_set_ssao(False):
+                        self.renderer.SetUseSSAO(False)
                     print("[editor] SSAO disabled during scene edit — "
                           "re-enable it from the SSAO checkbox if wanted")
             except Exception:
@@ -151,12 +363,19 @@ class UIMixin:
                 fn()
             except Exception as exc:
                 print(f"[editor] deferred edit failed: {exc}")
+            # Post-FX chains may hold G-buffers sized/bound to the old scene:
+            # drop the cache so any later SSAO re-enable starts fresh.
+            if getattr(self, "postfx", None) is not None:
+                try:
+                    self.postfx.invalidate()
+                except Exception:
+                    pass
             try:
                 self.plotter.render()
             except Exception:
                 pass
         try:
-            self.plotter.add_timer_event(max_steps=1, duration=50, callback=_cb)
+            add_timer(self.plotter, 50, _cb, repeating=False)
         except Exception:
             _cb()   # no timer support — run inline as fallback
 
@@ -166,7 +385,8 @@ class UIMixin:
 
         # Heavy editor modes must not run inside the VTK pick event (see
         # _defer_editor_work) — defer a re-entry with the picked point.
-        if (mode in ("roads", "roundabouts", "lights", "stops", "buildings", "highway")
+        if (mode in ("roads", "roundabouts", "lights", "stops", "buildings", "highway",
+                     "trees", "greenspace", "stairs", "strip", "drains")
                 and picker != "_deferred"):
             _pt = (float(point[0]), float(point[1]),
                    float(point[2]) if len(point) > 2 else 0.0)
@@ -360,6 +580,11 @@ class UIMixin:
                 self.octree_root = _build_octree_from_buildings(self.buildings_mesh)
                 self.scene_state["edge_shadow_cache"] = {}
                 self.scene_state["edge_costs_cache"] = {}
+                if getattr(self, "flood_lab", None) is not None:
+                    from floodsim.model import DesignObject
+                    _fp = np.array([[px - _w / 2, py - _d / 2], [px + _w / 2, py - _d / 2],
+                                    [px + _w / 2, py + _d / 2], [px - _w / 2, py + _d / 2]])
+                    self._design_add(DesignObject(key=_actor_name, kind="building", geom=_fp, label="building"))
                 self._request_shadow_render(
                     float(self.scene_state["hour"]),
                     float(self.scene_state["spot_radius"]))
@@ -481,6 +706,152 @@ class UIMixin:
             except Exception as exc:
                 import traceback
                 print(f"[editor] Highway placement failed: {exc}")
+                traceback.print_exc()
+            return
+
+        elif mode == "trees":
+            try:
+                px, py = float(point[0]), float(point[1])
+                self._add_tree_at(px, py)
+            except Exception as exc:
+                print(f"[editor] Tree placement failed: {exc}")
+            return
+
+        elif mode == "greenspace":
+            # Multi-click polygon tool, modeled on the bridge two-click state
+            # machine but generalized to N clicks: each click appends a point
+            # and redraws a live preview (points + connecting polyline);
+            # [Return] finalizes into a filled mesh, leaving the mode clears
+            # the in-progress point list (see _set_editor_mode).
+            try:
+                px, py = float(point[0]), float(point[1])
+                pts = self.scene_state.setdefault("_greenspace_pts", [])
+                pts.append((px, py))
+
+                _dem = self.street_graph.graph.get("terrain_sampler")
+                _prev_pts = np.array([[x, y, 0.3] for x, y in pts], dtype=float)
+                if self.scene_state.get("_terrain_drape_active") and _dem is not None:
+                    try:
+                        _prev_pts[:, 2] += np.asarray(_dem(_prev_pts[:, :2]), dtype=float)
+                    except Exception:
+                        pass
+                _prev_pd = pv.PolyData(_prev_pts)
+                if len(pts) >= 2:
+                    _n_pts = len(pts)
+                    _prev_pd.lines = np.hstack([[_n_pts] + list(range(_n_pts))]).astype(np.int64)
+                self.plotter.add_mesh(
+                    _prev_pd, color="#33cc66", point_size=10,
+                    render_points_as_spheres=True, line_width=3,
+                    lighting=False, reset_camera=False, name="greenspace_preview",
+                )
+                self._walk_hud(
+                    f"Greenspace: {len(pts)} point(s) — click to add more, "
+                    f"[Return]=finish  [j]=cancel")
+                print(f"[editor] Greenspace: point {len(pts)} added at ({px:.0f}, {py:.0f})")
+            except Exception as exc:
+                print(f"[editor] Greenspace point add failed: {exc}")
+            return
+
+        elif mode == "strip":
+            # Polyline tool for linear corridor elements (bioswale, permeable bike lane,
+            # porous sidewalk...): click along the strip, [Return] buffers it by the
+            # selected width into an area of the selected material.
+            try:
+                px, py = float(point[0]), float(point[1])
+                pts = self.scene_state.setdefault("_strip_pts", [])
+                pts.append((px, py))
+                _prev = np.array([[x, y, 0.4] for x, y in pts], dtype=float)
+                _dem = self.street_graph.graph.get("terrain_sampler")
+                if self.scene_state.get("_terrain_drape_active") and _dem is not None:
+                    _prev[:, 2] += np.asarray(_dem(_prev[:, :2]), dtype=float)
+                _pd = pv.PolyData(_prev)
+                if len(pts) >= 2:
+                    _pd.lines = np.hstack([[len(pts)] + list(range(len(pts)))]).astype(np.int64)
+                self.plotter.add_mesh(_pd, color="#e0c040", point_size=9, render_points_as_spheres=True,
+                                      line_width=4, lighting=False, reset_camera=False, name="strip_preview")
+                self._walk_hud(f"Strip: {len(pts)} point(s) — [Return]=finish  [1]=cancel")
+            except Exception as exc:
+                print(f"[editor] Strip point add failed: {exc}")
+            return
+
+        elif mode == "drains":
+            try:
+                self._add_drain_at(float(point[0]), float(point[1]))
+            except Exception as exc:
+                print(f"[editor] Drain placement failed: {exc}")
+            return
+
+        elif mode == "stairs":
+            # Two-click start/end tool, directly modeled on the highway/bridge
+            # state machine above but building a stepped ramp via
+            # make_stairs_mesh, with both ends' Z pulled from the terrain DEM
+            # (own "_stairs_start*" scratch keys — see _set_editor_mode).
+            try:
+                px, py = float(point[0]), float(point[1])
+                _dem = self.street_graph.graph.get("terrain_sampler")
+
+                def _z_at(x, y):
+                    if _dem is None:
+                        return 0.0
+                    try:
+                        return float(np.asarray(_dem(np.array([[x, y]])), dtype=float)[0])
+                    except Exception:
+                        return 0.0
+
+                pending = self.scene_state.get("_stairs_start")
+
+                if pending is None:
+                    self.scene_state["_stairs_start"] = (px, py)
+                    _sz = _z_at(px, py)
+                    _mk = pv.Sphere(radius=1.2, center=(px, py, _sz + 0.5))
+                    self.plotter.add_mesh(
+                        _mk, color="#c9a227", render_points_as_spheres=False,
+                        reset_camera=False, name="stairs_start_marker",
+                    )
+                    self.scene_state["_stairs_start_actor"] = True
+                    self._walk_hud("Stairs: start set — click second endpoint  [k]=cancel")
+                    print(f"[editor] Stairs: start at ({px:.0f}, {py:.0f})")
+                else:
+                    x1, y1 = pending
+                    if abs(x1 - px) < 1e-6 and abs(y1 - py) < 1e-6:
+                        print("[editor] Stairs: same point for start and end — click elsewhere")
+                        return
+                    z1 = _z_at(x1, y1)
+                    z2 = _z_at(px, py)
+
+                    from editor_ops import make_stairs_mesh
+                    _mesh = make_stairs_mesh(x1, y1, z1, px, py, z2)
+
+                    _undo = self._editor_push_undo(
+                        f"stairs ({x1:.0f},{y1:.0f})->({px:.0f},{py:.0f})")
+                    _n = int(self.scene_state.get("_user_stairs_count", 0)) + 1
+                    self.scene_state["_user_stairs_count"] = _n
+                    _sname = f"user_stairs_{_n}"
+                    _undo["actors"].append(_sname)
+                    self.scene_state[_sname] = self.plotter.add_mesh(
+                        _mesh, color="#c9a227", show_edges=True,
+                        smooth_shading=False, reset_camera=False, name=_sname,
+                    )
+                    if getattr(self, "flood_lab", None) is not None:
+                        # steps shed water: a 2.5 m wide impervious rough strip along the flight
+                        from shapely.geometry import LineString
+                        from floodsim.model import DesignObject
+                        _ring = np.asarray(LineString([(x1, y1), (px, py)]).buffer(1.25, cap_style=2).exterior.coords)[:-1]
+                        self._design_add(DesignObject(key=_sname, kind="area", cls=10, geom=_ring, label="stairs"))
+
+                    try:
+                        self.plotter.remove_actor("stairs_start_marker")
+                    except Exception:
+                        pass
+                    self.scene_state.pop("_stairs_start", None)
+                    self.scene_state.pop("_stairs_start_actor", None)
+
+                    self._walk_hud("")
+                    print(f"[editor] Stairs placed: ({x1:.0f},{y1:.0f}) -> "
+                          f"({px:.0f},{py:.0f})  (rise {z2 - z1:.1f} m)  ('o' to undo)")
+            except Exception as exc:
+                import traceback
+                print(f"[editor] Stairs placement failed: {exc}")
                 traceback.print_exc()
             return
 
@@ -607,7 +978,9 @@ class UIMixin:
                 except Exception as _bg_exc:
                     print(f"[pbr] failed to set background cubemap: {_bg_exc}")
             except Exception as _exc:
-                print(f"[pbr] dynamic HDRI unavailable ({_exc}); using gradient background")
+                has_skybox = self._apply_sky_environment(float(hour), sun_dir)
+                if not has_skybox:
+                    print(f"[pbr] dynamic HDRI unavailable ({_exc}); using gradient background")
 
             if not has_skybox:
                 bg = style.get("day_bg" if not is_night else "night_bg")
@@ -621,7 +994,8 @@ class UIMixin:
                 self.plotter.remove_actor("sun_sphere", reset_camera=False)
             except Exception:
                 pass
-            if not is_night:
+            _overcast = float(self.scene_state.get("overcast", 0.0))
+            if not is_night and _overcast < 0.5:
                 try:
                     _sun_pos = np.asarray(sun_dir, dtype=float) * 500.0
                     _sun_sphere = pv.Sphere(
@@ -639,7 +1013,7 @@ class UIMixin:
             try:
                 self.plotter.remove_all_lights()
                 _sun_pos = np.asarray(sun_dir, dtype=float) * 500.0
-                _sun_intensity = max(0.0, float(sun_dir[2])) * 0.9 + 0.1
+                _sun_intensity = (max(0.0, float(sun_dir[2])) * 0.9 + 0.1) * (1.0 - 0.88 * _overcast)
                 _sun_light = pv.Light(
                     light_type="scene light",
                     position=(float(_sun_pos[0]), float(_sun_pos[1]), float(_sun_pos[2])),
@@ -668,6 +1042,13 @@ class UIMixin:
             except Exception as _exc:
                 print(f"[light] dynamic scene light setup failed: {_exc}")
 
+            # Lit windows follow the hour on the slider path too (previously only
+            # the 't' time-lapse updated them).
+            try:
+                self._update_window_lights(float(hour), bool(is_night))
+            except Exception as _wl:
+                print(f"[windows] update failed: {_wl}")
+
             # Actor colors
             b_actor = self.scene_state.get("building_actor")
             _pbr_actors = self.scene_state.get("_building_actors_pbr", {})
@@ -678,6 +1059,9 @@ class UIMixin:
                         _ba.GetProperty().SetEdgeColor(_edge_rgb)
                     except Exception:
                         pass
+            _outl = self.scene_state.get("building_outline_actor")
+            if _outl is not None:
+                _outl.GetProperty().SetColor(_edge_rgb)
             elif b_actor is not None:
                 try:
                     b_actor.GetProperty().SetColor(pv.Color(str(style["building"])).float_rgb)
@@ -824,6 +1208,9 @@ class UIMixin:
                     self._set_actor_visibility(actor, bool(value))
             for _ua in self.scene_state.get("_ultra_car_actors") or []:
                 self._set_actor_visibility(_ua, bool(value))
+            _pf = self.scene_state.get("_parked_fleet")
+            if _pf is not None:
+                _pf.set_visible(bool(value))
             self.plotter.update()
 
     def _preset_mini(self, _: bool) -> None:
@@ -953,6 +1340,36 @@ class UIMixin:
             luminance = 0.299 * r + 0.587 * g + 0.114 * b
             return "#f4f4f4" if luminance < 128 else "#222222"
 
+    def _add_panel_backdrop(self, x0: float, y0: float, x1: float, y1: float) -> None:
+            """Translucent backdrop behind the control column (display px), so
+            its labels stay readable over any sky/scene (the physical sky is
+            darker than the old flat day background, and dark at night).
+            Light behind dark text, dark behind light text."""
+            import vtk
+            dark_text = self._panel_text_color() == "#222222"
+            pts = vtk.vtkPoints()
+            for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+                pts.InsertNextPoint(float(x), float(y), 0.0)
+            quad = vtk.vtkCellArray()
+            quad.InsertNextCell(4)
+            for i in range(4):
+                quad.InsertCellPoint(i)
+            pd = vtk.vtkPolyData()
+            pd.SetPoints(pts)
+            pd.SetPolys(quad)
+            mapper = vtk.vtkPolyDataMapper2D()
+            mapper.SetInputData(pd)
+            coord = vtk.vtkCoordinate()
+            coord.SetCoordinateSystemToDisplay()
+            mapper.SetTransformCoordinate(coord)
+            actor = vtk.vtkActor2D()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(*((0.96, 0.96, 0.95) if dark_text else (0.04, 0.05, 0.07)))
+            actor.GetProperty().SetOpacity(0.55 if dark_text else 0.45)
+            actor.PickableOff()
+            self.plotter.renderer.AddActor2D(actor)
+            self.scene_state["panel_backdrop_actor"] = actor
+
     def _panel_desc_color(self):
             # Muted but still readable
             base = self._panel_text_color()
@@ -1007,7 +1424,8 @@ class UIMixin:
 
     def _toggle_ssao(self, val: bool) -> None:
             try:
-                self.renderer.SetUseSSAO(bool(val))
+                if not self._postfx_set_ssao(bool(val)):
+                    self.renderer.SetUseSSAO(bool(val))
                 self.plotter.update()
             except Exception:
                 print("[ssao] SSAO unavailable")
@@ -1111,6 +1529,10 @@ class UIMixin:
     def _deferred_ssao_enable(self, _: int) -> None:
         try:
             self.plotter.render()   # flush pipeline before enabling SSAO to prevent dark first frame
+            if self._postfx_activate():
+                self.plotter.update()
+                print("[postfx] post-processing chain activated (deferred)")
+                return
             self.renderer.SetUseSSAO(True)
             self.plotter.update()
             print("[ssao] SSAO activated (deferred)")
@@ -1121,5 +1543,9 @@ class UIMixin:
         try:
             print("[timer] _deferred_initial_render: triggering initial shadow computation")
             self._request_shadow_render(12.0, float(self.args.light_radius))
+            if bool(getattr(self.args, "terrain_on", False)) and not bool(self.scene_state.get("_terrain_visible", False)) \
+                    and self.scene_state.get("terrain_actor") is not None:
+                self._toggle_terrain()
+                print("[terrain] enabled at startup (--terrain-on / preset)")
         except Exception as _exc:
             print(f"[init-render ERROR] {_exc}")

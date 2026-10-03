@@ -9,6 +9,18 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import osmnx as ox
+
+
+def _ovp_graph(*a, **k):
+    """ox.graph_from_point through the Overpass mirror fallback (osm_net)."""
+    from osm_net import with_overpass_fallback
+    return with_overpass_fallback(lambda: ox.graph_from_point(*a, **k))
+
+
+def _ovp_features(*a, **k):
+    """ox.features_from_point through the Overpass mirror fallback (osm_net)."""
+    from osm_net import with_overpass_fallback
+    return with_overpass_fallback(lambda: ox.features_from_point(*a, **k))
 import pyvista as pv
 from shapely.geometry import LineString, MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
@@ -728,7 +740,7 @@ def _fetch_land_fill_mesh(
     }
 
     try:
-        gdf = ox.features_from_point(center, tags={
+        gdf = _ovp_features(center, tags={
             "landuse": list({"farmland", "farmyard", "residential", "commercial", "retail",
                               "industrial", "construction", "brownfield", "grass", "meadow",
                               "recreation_ground", "village_green", "allotments", "cemetery",
@@ -888,7 +900,7 @@ def build_3d_buildings_and_street_graph(
 
     building_tags = {"building": True}
     try:
-        buildings: gpd.GeoDataFrame = ox.features_from_point(
+        buildings: gpd.GeoDataFrame = _ovp_features(
             center,
             tags=building_tags,
             dist=radius,
@@ -897,7 +909,7 @@ def build_3d_buildings_and_street_graph(
         buildings = gpd.GeoDataFrame()
 
     try:
-        street_graph = ox.graph_from_point(
+        street_graph = _ovp_graph(
             center,
             dist=radius,
             network_type="all",
@@ -923,7 +935,7 @@ def build_3d_buildings_and_street_graph(
     # Fetch Parks and Parking
     park_tags = {"leisure": "park", "landuse": ["grass", "meadow", "recreation_ground", "village_green"]}
     try:
-        parks: gpd.GeoDataFrame = ox.features_from_point(center, tags=park_tags, dist=radius)
+        parks: gpd.GeoDataFrame = _ovp_features(center, tags=park_tags, dist=radius)
         if not parks.empty:
             projected_parks = parks.to_crs(proj_str)
         else:
@@ -933,7 +945,7 @@ def build_3d_buildings_and_street_graph(
 
     parking_tags = {"amenity": "parking"}
     try:
-        parking: gpd.GeoDataFrame = ox.features_from_point(center, tags=parking_tags, dist=radius)
+        parking: gpd.GeoDataFrame = _ovp_features(center, tags=parking_tags, dist=radius)
         if not parking.empty:
             projected_parking = parking.to_crs(proj_str)
         else:
@@ -943,17 +955,17 @@ def build_3d_buildings_and_street_graph(
 
     # Fetch individual tree nodes and forest areas
     try:
-        _trees_gdf = ox.features_from_point(center, tags={"natural": "tree"}, dist=radius)
+        _trees_gdf = _ovp_features(center, tags={"natural": "tree"}, dist=radius)
         proj_trees = _trees_gdf.to_crs(proj_str) if not _trees_gdf.empty else gpd.GeoDataFrame()
     except Exception:
         proj_trees = gpd.GeoDataFrame()
     try:
-        _forests_gdf = ox.features_from_point(center, tags={"landuse": "forest"}, dist=radius)
+        _forests_gdf = _ovp_features(center, tags={"landuse": "forest"}, dist=radius)
         proj_forests = _forests_gdf.to_crs(proj_str) if not _forests_gdf.empty else gpd.GeoDataFrame()
     except Exception:
         proj_forests = gpd.GeoDataFrame()
     try:
-        _cross_gdf = ox.features_from_point(center, tags={"highway": "crossing"}, dist=radius)
+        _cross_gdf = _ovp_features(center, tags={"highway": "crossing"}, dist=radius)
         proj_crossings = _cross_gdf.to_crs(proj_str) if not _cross_gdf.empty else gpd.GeoDataFrame()
     except Exception:
         proj_crossings = gpd.GeoDataFrame()

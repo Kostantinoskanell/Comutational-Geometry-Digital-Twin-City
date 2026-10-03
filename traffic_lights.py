@@ -95,6 +95,12 @@ class TrafficLight:
     elapsed: float = 0.0
     offset: float = 0.0                  # stagger so not all lights change at once
     approach_points: dict[int, tuple[float, float, float]] = field(default_factory=dict)
+    # Mean approach bearing (deg, mod 180 so opposite directions match) of each
+    # phase's car-path group, set by build_traffic_lights. Lets a DIFFERENT
+    # agent class (cyclists, ...), whose own path list uses unrelated indices,
+    # be gated by this same light via its geometry instead of a path index —
+    # see can_enter_by_bearing / build_external_light_views.
+    phase_axis_bearing: list = field(default_factory=list, repr=False)
 
     # Derived from green_groups at build time
     _allowed: set = field(default_factory=set, repr=False)
@@ -155,6 +161,25 @@ class TrafficLight:
         if not self._allowed:
             return False
         return path_idx in self._allowed
+
+    def phase_for_bearing(self, bearing: float) -> int:
+        """Nearest phase axis (by circular distance mod 180) to `bearing`."""
+        if not self.phase_axis_bearing:
+            return 0
+        axis = bearing % 180
+        diffs = [
+            (min(abs(axis - a), 180 - abs(axis - a)) if a == a else float("inf"))  # a==a: not NaN
+            for a in self.phase_axis_bearing
+        ]
+        return int(np.argmin(diffs))
+
+    def can_enter_by_bearing(self, bearing: float) -> bool:
+        """Like can_enter, but for an agent whose own path index space this
+        light knows nothing about — classify its approach direction onto the
+        nearest phase axis instead."""
+        if self.state != "green" or not self.green_groups:
+            return False
+        return self.phase_for_bearing(bearing) == self.phase % len(self.green_groups)
 
     @property
     def color(self) -> str:
@@ -300,6 +325,23 @@ def build_traffic_lights(
         # yellow (clearance time grows with approach speed).
         green_durations, yellow_durations = _phase_timings(groups, car_paths)
 
+        # Mean bearing (mod 180, circular) of each phase's approaches, for
+        # can_enter_by_bearing — computed from the SAME in_edges bearings
+        # used to build `groups`, so it stays consistent even after the
+        # single-phase -> pedestrian-crossing rewrite above (empty group ->
+        # no bearing, phase_for_bearing just never selects it).
+        _bearing_by_idx = {idx: b for idx, _u, _v, b in in_edges}
+        phase_axis_bearing = []
+        for group in groups:
+            if not group:
+                phase_axis_bearing.append(float("nan"))
+                continue
+            axes = np.array([_bearing_by_idx[i] % 180 for i in group], dtype=float)
+            # Circular mean on [0, 180): double the angle, average, halve back.
+            ang = np.deg2rad(axes * 2)
+            m = math.degrees(math.atan2(np.mean(np.sin(ang)), np.mean(np.cos(ang)))) / 2.0
+            phase_axis_bearing.append(m % 180)
+
         ndata = graph.nodes.get(node_id, {})
         _cycle = sum(green_durations) + sum(yellow_durations) + n_phases * ALL_RED_PAUSE
         light = TrafficLight(
@@ -311,6 +353,7 @@ def build_traffic_lights(
             yellow_durations=yellow_durations,
             n_phases=n_phases,
             offset=float(rng.uniform(0, _cycle)),
+            phase_axis_bearing=phase_axis_bearing,
         )
         approach_points: dict[int, tuple[float, float, float]] = {}
         vx = float(ndata.get("x", 0.0))
@@ -333,6 +376,52 @@ def build_traffic_lights(
 
     print(f"[tl] {len(lights)} traffic lights created at degree≥{min_degree} nodes")
     return lights
+
+
+class _ExternalPathLightView:
+    """Adapts a real TrafficLight for an agent class with its OWN path index
+    space (e.g. cyclist_paths, unrelated to car_paths) — gates it by matching
+    each of its own path's approach bearing to the light's nearest phase axis
+    instead of by (meaningless, cross-list-collision-prone) path index.
+
+    Exposes exactly the interface idm.py's find_leaders needs
+    (`.controlled_paths`, `.can_enter(path_idx)`), so it drops into the
+    `traffic_lights` dict argument of idm_tick unchanged.
+    """
+    __slots__ = ("controlled_paths", "_light", "_bearing_by_idx")
+
+    def __init__(self, light: "TrafficLight", bearing_by_idx: dict[int, float]):
+        self._light = light
+        self._bearing_by_idx = bearing_by_idx
+        self.controlled_paths = frozenset(bearing_by_idx)
+
+    def can_enter(self, path_idx: int) -> bool:
+        bearing = self._bearing_by_idx.get(path_idx)
+        if bearing is None:
+            return True
+        return self._light.can_enter_by_bearing(bearing)
+
+
+def build_external_light_views(
+    graph, paths: list[dict], lights: Dict[object, TrafficLight],
+) -> Dict[object, _ExternalPathLightView]:
+    """Build `traffic_lights`-shaped views of the existing car-light FSMs for
+    a second agent class whose `paths` list (own u/v/index space) is unrelated
+    to the car_paths the lights were built from. See _ExternalPathLightView."""
+    entering: dict[object, dict[int, float]] = {}
+    for idx, path in enumerate(paths):
+        v = path["v"]
+        if v not in lights:
+            continue
+        u = path["u"]
+        if "x" not in graph.nodes.get(u, {}) or "x" not in graph.nodes.get(v, {}):
+            continue
+        entering.setdefault(v, {})[idx] = _edge_bearing(graph, u, v)
+
+    return {
+        node_id: _ExternalPathLightView(lights[node_id], bearing_by_idx)
+        for node_id, bearing_by_idx in entering.items()
+    }
 
 
 def tick_all(lights: Dict[object, TrafficLight], dt: float, traffic_speed: float):

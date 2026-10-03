@@ -188,8 +188,45 @@ class ParkingMixin:
         if changed:
             self._rebuild_parked_glyph()
 
+    def _pick_car_to_recycle(self) -> int | None:
+        """Choose which existing fleet car re-enters traffic from a parking exit.
+
+        The fleet is a fixed-size pool: every per-car array (car_len, accel,
+        idm_*_arr, planned_edges, stuck_time, …) and the renderer's actor pool
+        are sized once at startup, so an exit re-uses a car instead of growing
+        the fleet. Prefers cars with no active demand trip (so no journey is
+        cancelled), never the user-selected car, and among those the one
+        farthest from the camera focal point so the relocation is off-screen.
+        """
+        edge_idx = self.car_anim.get("edge_idx")
+        if edge_idx is None or len(edge_idx) == 0:
+            return None
+        n = int(len(edge_idx))
+        candidates = np.ones(n, dtype=bool)
+
+        selected = getattr(self, "route_state", {}).get("selected_car_idx")
+        if selected is not None and 0 <= int(selected) < n:
+            candidates[int(selected)] = False
+
+        plans = self.car_anim.get("planned_edges")
+        if plans is not None and len(plans) == n:
+            idle = np.array([p is None for p in plans], dtype=bool)
+            if (candidates & idle).any():
+                candidates &= idle
+        if not candidates.any():
+            return None
+
+        idx = np.flatnonzero(candidates)
+        pos = self.car_anim.get("pos")
+        try:
+            focal = np.asarray(self.plotter.camera.focal_point, dtype=float)[:2]
+            pos_xy = np.asarray(pos, dtype=float)[idx, :2]
+            return int(idx[int(np.argmax(np.linalg.norm(pos_xy - focal, axis=1)))])
+        except Exception:
+            return int(self._parking_rng.choice(idx))
+
     def _spawn_exiting_car(self, slot_idx: int) -> None:
-        """Insert a new IDM car near the vacated parking slot (best-effort)."""
+        """A car leaves a vacated parking slot and joins traffic (best-effort)."""
         if not hasattr(self, "car_anim") or not bool(self.car_anim.get("enabled")):
             return
         all_pos = self.scene_state.get("_parked_car_positions")
@@ -198,37 +235,43 @@ class ParkingMixin:
 
         slot_xy = all_pos[slot_idx, :2]
 
-        # Find the nearest car_path start-point
         try:
             path_starts = np.array(
                 [np.asarray(p["points"], dtype=float)[0, :2] for p in self.car_paths],
                 dtype=float,
             )
-            dists  = np.linalg.norm(path_starts - slot_xy, axis=1)
-            p_idx  = int(np.argmin(dists))
-            if float(dists[p_idx]) > 150.0:   # too far — skip
+            dists = np.linalg.norm(path_starts - slot_xy, axis=1)
+            p_idx = int(np.argmin(dists))
+            if float(dists[p_idx]) > 150.0:
                 return
 
-            edge_idx = np.asarray(self.car_anim["edge_idx"],       dtype=np.int64)
-            dist_arr = np.asarray(self.car_anim["dist"],            dtype=float)
-            speed_arr= np.asarray(self.car_anim["speed"],           dtype=float)
-            des_arr  = np.asarray(self.car_anim["desired_speed"],   dtype=float)
-            des_base = self.car_anim.get("desired_speed_base")
+            i = self._pick_car_to_recycle()
+            if i is None:
+                return
 
-            new_speed = float(
-                self.car_paths[p_idx]["maxspeed_ms"]
-                * self._parking_rng.uniform(0.6, 0.9)
+            base_speed = float(
+                self.car_paths[p_idx]["maxspeed_ms"] * self._parking_rng.uniform(0.6, 0.9)
             )
-            self.car_anim["edge_idx"]         = np.append(edge_idx, p_idx)
-            self.car_anim["dist"]             = np.append(dist_arr, 0.0)
-            self.car_anim["speed"]            = np.append(speed_arr, 1.0)
-            self.car_anim["desired_speed"]    = np.append(des_arr,   new_speed)
-            if des_base is not None:
-                self.car_anim["desired_speed_base"] = np.append(
-                    np.asarray(des_base, dtype=float), new_speed
-                )
-        except Exception:
-            pass
+            traffic_speed = float(getattr(self.args, "traffic_speed", 1.0))
+            ca = self.car_anim
+            ca["edge_idx"][i] = p_idx
+            ca["dist"][i] = 0.0
+            ca["speed"][i] = 1.0
+            if ca.get("desired_speed_base") is not None:
+                ca["desired_speed_base"][i] = base_speed
+            ca["desired_speed"][i] = base_speed * traffic_speed
+            for key in ("accel", "stop_wait", "stuck_time"):
+                arr = ca.get(key)
+                if arr is not None and len(arr) > i:
+                    arr[i] = 0.0
+            plans = ca.get("planned_edges")
+            if plans is not None and len(plans) > i:
+                plans[i] = None
+            cursors = ca.get("planned_cursor")
+            if cursors is not None and len(cursors) > i:
+                cursors[i] = 0
+        except Exception as exc:
+            print(f"[parking] exit spawn skipped: {exc}")
 
     def _rebuild_parked_glyph(self) -> None:
         """Rebuild the instanced glyph mesh reflecting current slot occupancy."""

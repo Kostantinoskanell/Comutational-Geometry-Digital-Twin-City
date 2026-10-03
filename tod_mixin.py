@@ -143,11 +143,12 @@ class TODMixin:
             self.plotter.set_environment_texture(hdri_tex)
             self.plotter.renderer.UseImageBasedLightingOn()
         except Exception:
-            bg = style.get("day_bg" if not is_night else "night_bg")
-            if isinstance(bg, list) and len(bg) == 2:
-                self.plotter.set_background(str(bg[0]), top=str(bg[1]))
-            else:
-                self.plotter.set_background(str(bg or "#87ceeb"))
+            if not self._apply_sky_environment(float(hour), sun_dir):
+                bg = style.get("day_bg" if not is_night else "night_bg")
+                if isinstance(bg, list) and len(bg) == 2:
+                    self.plotter.set_background(str(bg[0]), top=str(bg[1]))
+                else:
+                    self.plotter.set_background(str(bg or "#87ceeb"))
 
         # Sun sphere
         try:
@@ -261,6 +262,11 @@ class TODMixin:
             except Exception:
                 pass
 
+        # Procedural facades carry real lit windows (emissive map); the old
+        # point-sprite "windows" would double them, so only use those without.
+        if self._set_facade_emission(float(w_factor)):
+            self._update_window_light_points(12.0, False)     # removes any sprites
+            return
         # Geometric window lights: small glowing point sprites on building faces
         self._update_window_light_points(hour, is_night)
 

@@ -352,6 +352,16 @@ def validate_congested(
 
     # Annotate edges with congested travel time
     _annotate_traveltime(graph)  # ensures "tt" exists (free-flow fallback)
+    # Seed every edge's tt_cong from free-flow "tt" BEFORE the car_paths loop
+    # below overwrites the (typically small) subset actually covered by
+    # car_paths with the real congestion-aware value. Edges car_paths never
+    # touches (filtered out of the drivable subgraph, pedestrian-only, ...)
+    # would otherwise have no "tt_cong" attribute at all — and networkx's
+    # weight="tt_cong" silently treats a MISSING attribute as cost 1 SECOND,
+    # not free-flow time, so shortest-path searches would cut through those
+    # edges for free and report travel times far too low.
+    for _, _, _edata in graph.edges(data=True):
+        _edata["tt_cong"] = _edata.get("tt", 1.0)
     for pidx, path in enumerate(car_paths):
         u, v = path.get("u"), path.get("v")
         if u is None or v is None:
@@ -501,6 +511,11 @@ def validate_engine_comparison(
         return {"error": "networkx not available"}
 
     _annotate_traveltime(graph)
+    # Same fallback-before-override as validate_congested's tt_cong (see the
+    # comment there): without this, edges car_paths_idm never covers have no
+    # "tt_idm" attribute, and weight="tt_idm" silently costs 1 second for them.
+    for _, _, _edata in graph.edges(data=True):
+        _edata["tt_idm"] = _edata.get("tt", 1.0)
 
     # ── IDM speeds from live car_anim ────────────────────────────────────────
     edge_idx_arr = np.asarray(car_anim_idm.get("edge_idx", []), dtype=np.int64)
@@ -545,7 +560,11 @@ def validate_engine_comparison(
     for u, v, key, edata in graph.edges(data=True, keys=True):
         osmid = str(edata.get("osmid", ""))
         sumo_tt = sumo_edge_tt.get(osmid) or sumo_edge_tt.get(f"{osmid}#{key}")
-        edata["tt_sumo"] = float(sumo_tt) if sumo_tt else float(edata.get("tt_idm", edata.get("tt", 0.0)))
+        # tt_idm and tt are now both guaranteed present (seeded above / by
+        # _annotate_traveltime) — the final 0.0 is only a last-resort guard,
+        # not the common case; a real 0.0 here would make shortest-path
+        # searches exploit this edge for free.
+        edata["tt_sumo"] = float(sumo_tt) if sumo_tt else float(edata.get("tt_idm", edata.get("tt", 1.0)))
 
     nodes = [n for n, d in graph.nodes(data=True) if "x" in d and "y" in d]
     if len(nodes) < 4:

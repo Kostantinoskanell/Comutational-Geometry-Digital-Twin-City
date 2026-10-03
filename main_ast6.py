@@ -270,12 +270,26 @@ from sumo_mixin import SumoMixin
 from demand_mixin import DemandMixin
 from walk_mixin import WalkMixin
 from scenario_mixin import ScenarioMixin
+from flood_mixin import FloodMixin
+from vtk_timers import add_timer
+from render.survey_mixin import SurveyMixin
+from render.lighting_mixin import LightingMixin
+from flood_lab_mixin import FloodLabMixin
 
 class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                      WeatherMixin, TODMixin, ParkingMixin, TerrainMixin, HeatmapMixin,
                      SumoMixin, DemandMixin, WalkMixin,
-                     ShadowMixin, RouteMixin, UIMixin, AnalysisMixin, ScenarioMixin):
+                     ShadowMixin, RouteMixin, UIMixin, AnalysisMixin, ScenarioMixin,
+                     FloodMixin, FloodLabMixin, SurveyMixin, LightingMixin):
     def __init__(self):
+        # Guards run() against a half-built object: __init__ has a couple of
+        # early `return`s (no buildings found, geometry fetch failed) that
+        # only exit the constructor — Python still hands back a "successful"
+        # object either way, so without this flag __main__'s app.run() would
+        # proceed and crash with a confusing AttributeError on some
+        # never-assigned attribute (e.g. self.buildings_mesh) instead of the
+        # actual, already-printed root cause.
+        self._init_ok = False
 
         self.args = parse_args()
         if self.args.gui:
@@ -321,6 +335,13 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
         self.args.traffic_speed = max(0.0, float(self.args.traffic_speed))
         self.args.debug_cars = bool(getattr(self.args, "debug_cars", False))
         self.args.solar_fleet = bool(getattr(self.args, "solar_fleet", False))
+        self.args.flood_analysis = bool(getattr(self.args, "flood_analysis", False))
+        self.args.flood_storm = str(getattr(self.args, "flood_storm", "v1_nov2025")).strip().lower()
+        if self.args.flood_storm not in {"t2", "t10", "t10cc", "t50", "flat30", "v1_nov2025"}:
+            self.args.flood_storm = "v1_nov2025"
+        self.args.flood_phase = str(getattr(self.args, "flood_phase", "after")).strip().lower()
+        if self.args.flood_phase not in {"before", "after"}:
+            self.args.flood_phase = "after"
         self.args.solo = bool(getattr(self.args, "solo", False))
         self.args.light_strategy = str(getattr(self.args, "light_strategy", "smart")).strip().lower()
         if self.args.light_strategy not in {"smart", "ga"}:
@@ -436,6 +457,9 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
             print(f"Failed to fetch/build geometry: {exc}")
             return
         self._stage(f"OSM + geometry ready in {time.perf_counter() - t_osm:.2f}s")
+
+        # Drone-survey DTM becomes THE terrain sampler before anything samples it.
+        self._init_survey_terrain()
 
         # Warm up Numba JIT synchronously so concurrent access is impossible.
         from shadow_engine import _warmup_numba_kernels
@@ -616,10 +640,16 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
             except Exception as exc:
                 print(f"GA test failed: {exc}")
 
+        self._init_ok = True
+
     def run(self) -> None:
         """Open the 3D viewer. Must be called from the top-level __main__ block
         (not from __init__) so that macOS Cocoa has a valid NSRunLoop at the
         outermost Python frame when plotter.show() is called."""
+        if not self._init_ok:
+            print("[app] initialization did not complete (see the error above) — nothing to run.")
+            return
+
         # Travel-time validation runs without the viewer (and even with --no-view).
         if int(getattr(self.args, "validate_od", 0)) > 0:
             self._run_travel_time_validation()
@@ -1174,21 +1204,32 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                 # Sea-background plane: closes the gap where the OSM water polygon
                 # stops short of the viewport in open-sea areas. Sits above the
                 # base ground (-0.10) but below the fill mesh (0.02), and extends
-                # 3× beyond the scene so the horizon reads as water. Only added
+                # 3x beyond the scene (floored at 4000m) so the horizon reads as
+                # water at any zoom level — for small --radius scenes, 3x the tiny
+                # city bbox alone (e.g. ~1.5km pad for radius=250m) reads as a
+                # small disconnected patch once the camera zooms out to an
+                # establishing shot, rather than a proper horizon. Only added
                 # when the scene actually contains water — inland scenes keep the
                 # dark slate ground in untagged gaps.
                 if _has_water:
-                    _sea_pad = max(_bx1 - _bx0, _by1 - _by0) * 3.0
+                    _sea_pad = max(max(_bx1 - _bx0, _by1 - _by0) * 3.0, 4000.0)
                     _sea_pts = np.array([
                         [_bx0 - _sea_pad, _by0 - _sea_pad, -0.05],
                         [_bx1 + _sea_pad, _by0 - _sea_pad, -0.05],
                         [_bx1 + _sea_pad, _by1 + _sea_pad, -0.05],
                         [_bx0 - _sea_pad, _by1 + _sea_pad, -0.05],
                     ], dtype=float)
+                    # lighting=True (VTK computes specular per-pixel, not just
+                    # per-vertex, so a single flat quad already gets a correct
+                    # sun-glint highlight across its whole surface — no extra
+                    # geometry needed) + matching water_mesh's color/shading so
+                    # this padding plane reads as a continuation of the real
+                    # (small) OSM water polygon instead of a flat dead patch
+                    # visibly seaming against it.
                     _sea_mesh = pv.PolyData(_sea_pts, faces=np.array([4, 0, 1, 2, 3]))
                     self.scene_state["sea_actor"] = self.plotter.add_mesh(
-                        _sea_mesh, color="#2e6ea6",
-                        smooth_shading=False, lighting=False,
+                        _sea_mesh, color="#3d7ab5",
+                        smooth_shading=True, lighting=True, specular=0.6, specular_power=20,
                         name="sea_background",
                     )
                     self._stage("Sea-background plane added")
@@ -1216,7 +1257,7 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
 
             if self.water_mesh is not None and self.water_mesh.n_cells > 0:
                 try:
-                    self.plotter.add_mesh(
+                    self.scene_state["water_actor"] = self.plotter.add_mesh(
                         self.water_mesh, color="#3d7ab5",
                         smooth_shading=True, lighting=True, opacity=0.85,
                     )
@@ -1225,11 +1266,25 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                     print(f"[water] render failed: {_we}")
             # ─────────────────────────────────────────────────────────────────────
 
+            # Ortho-textured ground over the drone-survey footprint (WG)
+            try:
+                self._init_photoreal_ground()
+            except Exception as _pg:
+                print(f"[survey] photoreal ground skipped: {_pg}")
+
             # Terrain: must run AFTER fill mesh is rendered so it can replace it
             self._init_terrain()
 
             # Air-quality / noise heatmap (hidden until 'q' pressed)
             self._init_aq_overlay()
+
+            # Beirut flood analysis (opt-in, --flood-analysis): import precomputed
+            # flood-depth + green-corridor design and build the two static overlays.
+            if bool(self.args.flood_analysis):
+                try:
+                    self._import_and_render_flood()
+                except Exception as _fe:
+                    print(f"[flood] flood analysis dispatch failed: {_fe}")
 
             self._stage(f"Adding buildings mesh ({self.buildings_mesh.n_cells} cells)...")
 
@@ -1246,6 +1301,11 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                 print("[ssao] SSAO configured (deferred activation)")
             except Exception:
                 print("[ssao] SSAO unavailable")
+            try:
+                self._init_postfx()
+            except Exception as _pfx:
+                self.postfx = None
+                print(f"[postfx] post-processing unavailable ({_pfx}); legacy renderer path")
 
             import colorsys as _cs
             _pbr_rng = np.random.default_rng(int(self.args.seed) ^ 0x4321)
@@ -1283,7 +1343,9 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                         roughness=_cp["roughness"],
                         color=_varied,
                         smooth_shading=True,
-                        show_edges=True,
+                        # Triangle wireframe only in the legacy look; otherwise true
+                        # feature edges are drawn once below (no wall diagonals).
+                        show_edges=str(getattr(self.args, "render_quality", "quality")) == "legacy",
                         edge_color=str(st["building_edge"]),
                         line_width=0.4,
                         opacity=1.0,
@@ -1306,63 +1368,50 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                     )
 
             self.scene_state["_building_actors_pbr"] = _pbr_actors
+            if str(getattr(self.args, "render_quality", "quality")) != "legacy" and self.buildings_mesh.n_cells:
+                try:
+                    # Creases/silhouette-ready outlines: feature edges of the
+                    # point-merged mesh, so coplanar triangulation diagonals vanish.
+                    _outline = self.buildings_mesh.extract_surface(algorithm="dataset_surface").clean(
+                        tolerance=1e-6).extract_feature_edges(
+                        feature_angle=30.0, boundary_edges=True, non_manifold_edges=False, manifold_edges=False)
+                    if _outline.n_cells:
+                        self.scene_state["building_outline_actor"] = self.plotter.add_mesh(
+                            _outline, color=str(st["building_edge"]), line_width=1.0, opacity=0.55,
+                            name="building_outline", reset_camera=False)
+                        self.scene_state["building_outline_actor"].PickableOff()   # never steal clicks
+                except Exception as _oe:
+                    print(f"[buildings] outline edges skipped: {_oe}")
+            try:
+                self._init_photoreal_roofs()
+            except Exception as _pr:
+                print(f"[survey] photoreal rooftops skipped: {_pr}")
+            try:
+                self._init_survey_structures()
+            except Exception as _ps:
+                print(f"[survey] survey structures skipped: {_ps}")
+            try:
+                self._init_facades()
+            except Exception as _pf:
+                print(f"[facades] skipped: {_pf}")
+
+            try:
+                self._init_flood_lab()
+            except Exception as _fl:
+                self.flood_lab = None
+                print(f"[flood-lab] disabled: {_fl}")
 
             # ── Trees from OSM (natural=tree + landuse=forest) ────────────────────
             _tree_data = self.street_graph.graph.get("trees", [])
             if _tree_data:
                 if len(_tree_data) > 600:
                     _tree_data = [_tree_data[i] for i in np.random.default_rng(42).permutation(len(_tree_data))[:600]]
-                _CANOPY_COLORS = {"oak": "#2d5a27", "birch": "#90c47a", "default": "#3a7d44"}
-                _trunk_tmpl  = pv.Cylinder(radius=0.25, height=4.0, center=(0, 0, 2.0),
-                                           direction=(0, 0, 1), resolution=6, capping=True)
-                _canopy_tmpl = pv.Sphere(radius=3.0, theta_resolution=8, phi_resolution=8)
+                # Procedural Mediterranean species (render.trees), grouped by
+                # (species, variant); flat seeds + templates feed the drape.
+                from render.trees import add_tree_groups
                 _txy_arr = np.array([[t["x"], t["y"]] for t in _tree_data], dtype=float)
-                _tree_dem = self.street_graph.graph.get("terrain_sampler")
-
-                # Flat seeds (z=0) stored for reversible terrain toggling
-                self.scene_state.setdefault("_tree_seeds_flat",   {})
-                self.scene_state.setdefault("_tree_templates",    {})
-                self.scene_state.setdefault("_tree_actor_kwargs", {})
-                _trunk_flat = np.column_stack([_txy_arr, np.zeros(len(_txy_arr))])
-                self.scene_state["_tree_seeds_flat"]["osm_trunk"]    = _trunk_flat
-                self.scene_state["_tree_templates"]["osm_trunk"]     = _trunk_tmpl
-                self.scene_state["_tree_actor_kwargs"]["osm_trunk"]  = dict(
-                    color="#5c3d1e", smooth_shading=True, pbr=True, roughness=0.9, metallic=0.0,
-                )
-
-                # Always rendered FLAT — the terrain drape toggle lifts tree
-                # actors from _tree_seeds_flat when the user enables Terrain.
-                # (Baking DEM height here left trees floating in the default
-                # flat scene.)
-                _trunk_pd = pv.PolyData(_trunk_flat)
-                self.plotter.add_mesh(
-                    _trunk_pd.glyph(geom=_trunk_tmpl, orient=False, scale=False),
-                    name="_tree_osm_trunk",
-                    color="#5c3d1e", smooth_shading=True, pbr=True, roughness=0.9, metallic=0.0,
-                )
-
-                _sp_groups: dict[str, list] = {"oak": [], "birch": [], "default": []}
-                for _td in _tree_data:
-                    _s = _td.get("species", "")
-                    _k = "birch" if ("birch" in _s or "betula" in _s) else ("oak" if ("oak" in _s or "quercus" in _s) else "default")
-                    _sp_groups[_k].append([_td["x"], _td["y"]])
-                for _sk, _sxy in _sp_groups.items():
-                    if not _sxy:
-                        continue
-                    _sxy_arr  = np.array(_sxy, dtype=float)
-                    _tkey     = f"osm_canopy_{_sk}"
-                    _ckwargs  = dict(color=_CANOPY_COLORS[_sk], smooth_shading=True, pbr=True,
-                                     roughness=0.8, metallic=0.0, opacity=0.95)
-                    _canopy_flat = np.column_stack([_sxy_arr, np.full(len(_sxy_arr), 5.0)])
-                    self.scene_state["_tree_seeds_flat"][_tkey]   = _canopy_flat
-                    self.scene_state["_tree_templates"][_tkey]    = _canopy_tmpl
-                    self.scene_state["_tree_actor_kwargs"][_tkey] = _ckwargs
-                    _cp_pd = pv.PolyData(_canopy_flat)   # flat; drape lifts dynamically
-                    self.plotter.add_mesh(
-                        _cp_pd.glyph(geom=_canopy_tmpl, orient=False, scale=False),
-                        name=f"_tree_{_tkey}",
-                        **_ckwargs,
-                    )
+                add_tree_groups(self.plotter, self.scene_state, "osm", _txy_arr,
+                                tags=[str(t.get("species", "")) for t in _tree_data])
                 self._stage(f"Trees: {len(_tree_data)} rendered (OSM)")
 
             if not _tree_data:
@@ -1397,41 +1446,8 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                                                 _my + _py * 4.0 * _side])
                     _syn_xy = _syn_xy[:500]
                     if _syn_xy:
-                        _t_arr = np.array(_syn_xy, dtype=float)
-                        _ttmpl = pv.Cylinder(radius=0.20, height=3.5, center=(0, 0, 1.75),
-                                             direction=(0, 0, 1), resolution=5, capping=True)
-                        _ctmpl = pv.Sphere(radius=2.5, theta_resolution=7, phi_resolution=7)
-
-                        # Flat seeds stored for reversible terrain toggling
-                        self.scene_state.setdefault("_tree_seeds_flat",   {})
-                        self.scene_state.setdefault("_tree_templates",    {})
-                        self.scene_state.setdefault("_tree_actor_kwargs", {})
-                        _syn_trunk_flat  = np.column_stack([_t_arr, np.zeros(len(_t_arr))])
-                        _syn_canopy_flat = np.column_stack([_t_arr, np.full(len(_t_arr), 4.5)])
-                        self.scene_state["_tree_seeds_flat"]["syn_trunk"]    = _syn_trunk_flat
-                        self.scene_state["_tree_templates"]["syn_trunk"]     = _ttmpl
-                        self.scene_state["_tree_actor_kwargs"]["syn_trunk"]  = dict(
-                            color="#4a2e0e", smooth_shading=True, lighting=True,
-                        )
-                        self.scene_state["_tree_seeds_flat"]["syn_canopy"]   = _syn_canopy_flat
-                        self.scene_state["_tree_templates"]["syn_canopy"]    = _ctmpl
-                        self.scene_state["_tree_actor_kwargs"]["syn_canopy"] = dict(
-                            color="#2e6b28", smooth_shading=True, lighting=True, opacity=0.92,
-                        )
-
-                        # Flat — terrain drape lifts from _tree_seeds_flat on demand
-                        _tpd = pv.PolyData(_syn_trunk_flat)
-                        _cpd = pv.PolyData(_syn_canopy_flat)
-                        self.plotter.add_mesh(
-                            _tpd.glyph(geom=_ttmpl, orient=False, scale=False),
-                            name="_tree_syn_trunk",
-                            color="#4a2e0e", smooth_shading=True, lighting=True,
-                        )
-                        self.plotter.add_mesh(
-                            _cpd.glyph(geom=_ctmpl, orient=False, scale=False),
-                            name="_tree_syn_canopy",
-                            color="#2e6b28", smooth_shading=True, lighting=True, opacity=0.92,
-                        )
+                        from render.trees import add_tree_groups
+                        add_tree_groups(self.plotter, self.scene_state, "syn", np.array(_syn_xy, dtype=float))
                         self._stage(f"Trees: {len(_syn_xy)} street trees (synthetic fallback)")
                 except Exception as _te:
                     print(f"[trees] synthetic fallback failed: {_te}")
@@ -1744,6 +1760,26 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
             self.plotter.add_key_event("g", lambda: self._set_editor_mode("buildings"))
             # 'y' = highway/bridge editor
             self.plotter.add_key_event("y", lambda: self._set_editor_mode("highway"))
+            # ── Green-corridor authoring tools (Part 4) ─────────────────────────
+            # 'l'/'j'/'k' chosen after checking every add_key_event call in the
+            # whole repo, including ones registered lazily at runtime (not just
+            # in this file): 't' looked free here but tod_mixin.py's
+            # _animate_tod() registers 't' -> _toggle_tod() on its first tick,
+            # which fires AFTER this setup block and would silently steal the
+            # binding (pyvista's add_key_event overwrites same-key callbacks),
+            # making the trees tool unreachable. 'r' = camera elevation and
+            # 'u' = SUMO congestion toggle (below) were already taken too.
+            # Only 'l' and 'q' were free repo-wide; 'l' used here, 'q' left free.
+            self.plotter.add_key_event("l", lambda: self._set_editor_mode("trees"))
+            self.plotter.add_key_event("j", lambda: self._set_editor_mode("greenspace"))
+            self.plotter.add_key_event("k", lambda: self._set_editor_mode("stairs"))
+            self.plotter.add_key_event("S", lambda: self._set_editor_mode("strip"))
+            self.plotter.add_key_event("D", lambda: self._set_editor_mode("drains"))
+            self.plotter.add_key_event("F", lambda: self.flood_lab_run(design=False) if getattr(self, "flood_lab", None) else None)
+            self.plotter.add_key_event("H", lambda: self.flood_lab_fly_hotspot() if getattr(self, "flood_lab", None) else None)
+            self.plotter.add_key_event("E", lambda: self.flood_lab_run(design=True) if getattr(self, "flood_lab", None) else None)
+            # Finalize an in-progress greenspace polygon (only acts in that mode)
+            self.plotter.add_key_event("Return", lambda: self._finalize_greenspace())
             # ─────────────────────────────────────────────────────────────────────
 
             # ── Scenario comparison keys ──────────────────────────────────────────
@@ -1900,8 +1936,8 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                     rng=[0.0, 24.0],
                     value=12.0,
                     title="Hour",
-                    pointa=(0.02, 0.14),
-                    pointb=(0.24, 0.14),
+                    pointa=(0.19, 0.14),
+                    pointb=(0.41, 0.14),
                     style="modern",
                     interaction_event="end",
                     title_height=0.018,
@@ -1913,8 +1949,8 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                     rng=[max(5.0, self.args.light_radius * 0.4), self.args.light_radius * 3.0],
                     value=float(self.args.light_radius),
                     title="Light radius",
-                    pointa=(0.02, 0.08),
-                    pointb=(0.24, 0.08),
+                    pointa=(0.19, 0.08),
+                    pointb=(0.41, 0.08),
                     style="modern",
                     interaction_event="end",
                     title_height=0.018,
@@ -1925,7 +1961,8 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
             # ── Clean upper-left control panel ───────────────────────────────────
             # Layout: checkbox at x=8px, label text at x_norm=0.042 (~59px).
             # Rows count down from PANEL_TOP in 30px steps (window height=900).
-            # Sliders remain at the bottom (y_norm 0.08 and 0.14) — no overlap.
+            # Sliders sit at the bottom (y_norm 0.08 / 0.14) RIGHT of the panel column
+            # (x_norm 0.19-0.41): at x 0.02 they overlapped the flood rows 22-25.
 
             _CX = 8       # checkbox pixel x
             _CS = 22      # checkbox size (px)
@@ -1933,6 +1970,12 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
 
             _TC = self._panel_text_color()
             _DC = self._panel_desc_color()
+
+            # Backdrop first so it is drawn behind the labels and checkboxes
+            try:
+                self._add_panel_backdrop(2, self._cy(25 if (bool(getattr(self.args, 'flood_analysis', False)) or getattr(self, 'flood_lab', None) is None) else 22) - 22, 232, self._cy(0) + 30)
+            except Exception as _bd:
+                print(f"[ui] panel backdrop skipped: {_bd}")
 
             # ── Section: Visibility ───────────────────────────────────────────
             self.plotter.add_text("Controls", position=(_TX, self._cy(0) + 2),
@@ -1999,11 +2042,9 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
             _r_ssao = self._cy(9.2)
             self.plotter.add_text("SSAO",      position=(_TX, _r_ssao), name="panel_ssao",   font_size=9, color=_TC, viewport=False)
 
-            _ssao_enabled = False
-            try:
-                    _ssao_enabled = bool(self.renderer.GetUseSSAO())
-            except Exception:
-                    _ssao_enabled = False
+            # Post-FX chain: show the state the deferred activation will set.
+            _ssao_enabled = (bool(getattr(self, "_postfx_ssao_wanted", False))
+                             if getattr(self, "postfx", None) is not None else self._postfx_ssao_on())
             self.plotter.add_checkbox_button_widget(
                 self._toggle_ssao, value=_ssao_enabled,
                 position=(_CX, _r_ssao), size=_CS, color_on="#6cb6ff", color_off="#3a3f4b",
@@ -2066,6 +2107,60 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                 value=False,
                 position=(_CX, _rq), size=_CS, color_on="#e05c5c", color_off="#3a3f4b",
             )
+
+            # Beirut flood puddles + green-corridor material overlays — only
+            # meaningful (actors exist) when --flood-analysis built them at startup.
+            # Rows 22/23 (not 18/20) to avoid colliding with the "Solar routing"
+            # section below, which occupies rows 15/18/19/21.
+            # (The Flood Lab replaces these precomputed-result toggles; they remain for --flood-analysis.)
+            if bool(getattr(self.args, "flood_analysis", False)) or getattr(self, "flood_lab", None) is None:
+                _rfl = self._cy(22)
+                self.plotter.add_text("Flood puddles", position=(_TX, _rfl), name="panel_flood_t", font_size=9, color=_TC, viewport=False)
+                self.plotter.add_checkbox_button_widget(
+                    lambda _v: self._toggle_flood_overlay() if hasattr(self, "_toggle_flood_overlay") else None,
+                    value=False,
+                    position=(_CX, _rfl), size=_CS, color_on="#4aa3e0", color_off="#3a3f4b",
+                )
+
+                _rco = self._cy(23)
+                self.plotter.add_text("Corridor GI", position=(_TX, _rco), name="panel_corridor_t", font_size=9, color=_TC, viewport=False)
+                self.plotter.add_checkbox_button_widget(
+                    lambda _v: self._toggle_corridor_overlay() if hasattr(self, "_toggle_corridor_overlay") else None,
+                    value=False,
+                    position=(_CX, _rco), size=_CS, color_on="#4ecb71", color_off="#3a3f4b",
+                )
+
+                # Puddle time-lapse play/pause — only does anything if the
+                # selected storm/phase had depth_*.npy frame snapshots saved
+                # (scripts/flood_gpu.py --save-every); otherwise _toggle_flood_animation
+                # prints a clear "no time-series" message instead of silently no-op'ing.
+                _rfa = self._cy(24)
+                self.plotter.add_text("Flood time-lapse ▶", position=(_TX, _rfa), name="panel_flood_anim_t", font_size=9, color=_TC, viewport=False)
+                self.plotter.add_checkbox_button_widget(
+                    lambda _v: self._toggle_flood_animation() if hasattr(self, "_toggle_flood_animation") else None,
+                    value=False,
+                    position=(_CX, _rfa), size=_CS, color_on="#e0a84a", color_off="#3a3f4b",
+                )
+
+            # Photoreal survey ground vs stylized analysis ground (shadow and
+            # night-lighting classes live on the stylized layer underneath).
+            if self.scene_state.get("survey_ground_actor") is not None:
+                _rpg = self._cy(25 if (bool(getattr(self.args, 'flood_analysis', False)) or getattr(self, 'flood_lab', None) is None) else 22)
+                self.plotter.add_text("Photoreal ground", position=(_TX, _rpg), name="panel_photoreal_t", font_size=9, color=_TC, viewport=False)
+                self.plotter.add_checkbox_button_widget(
+                    lambda _v: (self._set_photoreal_ground(bool(_v)), self.plotter.render()),
+                    value=bool(self.scene_state.get("photoreal_ground", False)),
+                    position=(_CX, _rpg), size=_CS, color_on="#c9a86a", color_off="#3a3f4b",
+                )
+
+            # ── Flood Lab panel (right column) ────────────────────────────────
+            if getattr(self, "flood_lab", None) is not None:
+                try:
+                    self._build_flood_lab_panel()
+                except Exception as _flp:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"[flood-lab] panel failed: {_flp}")
 
             # ── Section: Solar routing (solarcar fleet only) ──────────────────
             if bool(self.scene_state.get("solar_fleet", False)):
@@ -2274,43 +2369,46 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
             if sys.platform != "darwin":
                 # Windows/Linux: VTK's native interactor loop pumps the OS message
                 # queue AND fires these NSTimer/Win-timer-backed callbacks.
-                self.plotter.add_timer_event(max_steps=10_000_000, duration=250, callback=self._poll_shadow_job)
+                add_timer(self.plotter, 250, self._poll_shadow_job)
                 if hasattr(self, "_scenario_poll"):
-                    self.plotter.add_timer_event(max_steps=10_000_000, duration=250, callback=lambda *_: self._scenario_poll())
-                self.plotter.add_timer_event(max_steps=10_000_000, duration=500, callback=self._poll_ga_done)
+                    add_timer(self.plotter, 250, lambda *_: self._scenario_poll())
+                add_timer(self.plotter, 500, self._poll_ga_done)
                 if bool(self.car_anim["enabled"]) and float(self.args.traffic_speed) > 0.0:
-                    self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_cars)
+                    add_timer(self.plotter, car_timer_ms, self._animate_cars)
                     print(f"[cars] animation timer registered ({car_timer_ms} ms)")
                 if bool(self.ped_anim.get("enabled", False)):
-                    self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_peds)
+                    add_timer(self.plotter, car_timer_ms, self._animate_peds)
                     print(f"[peds] animation timer registered ({car_timer_ms} ms)")
                 if bool(self.cyclist_anim.get("enabled", False)):
-                    self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_cyclists)
+                    add_timer(self.plotter, car_timer_ms, self._animate_cyclists)
                     print(f"[cyclists] animation timer registered ({car_timer_ms} ms)")
                 if getattr(self, "buses", []) or getattr(self, "gtfs_rt", {}).get("enabled"):
-                    self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_buses)
+                    add_timer(self.plotter, car_timer_ms, self._animate_buses)
                     print(f"[buses] animation timer registered ({car_timer_ms} ms)")
-                self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_emergency)
+                add_timer(self.plotter, car_timer_ms, self._animate_emergency)
                 print(f"[emergency] animation timer registered ({car_timer_ms} ms)")
-                self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_weather)
+                add_timer(self.plotter, car_timer_ms, self._animate_weather)
                 print(f"[weather] animation timer registered ({car_timer_ms} ms)")
-                self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_tod)
+                add_timer(self.plotter, car_timer_ms, self._animate_tod)
                 print(f"[tod] animation timer registered ({car_timer_ms} ms)")
-                self.plotter.add_timer_event(max_steps=10_000_000, duration=500, callback=self._animate_parking)
+                add_timer(self.plotter, 500, self._animate_parking)
                 print("[parking] animation timer registered (500 ms)")
-                self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_aq_overlay)
+                add_timer(self.plotter, car_timer_ms, self._animate_aq_overlay)
                 print(f"[heatmap] animation timer registered ({car_timer_ms} ms)")
+                if hasattr(self, "_animate_flood_puddles"):
+                    add_timer(self.plotter, car_timer_ms, self._animate_flood_puddles)
+                    print(f"[flood] time-lapse animation timer registered ({car_timer_ms} ms)")
                 if getattr(self, "sumo", {}).get("enabled"):
-                    self.plotter.add_timer_event(max_steps=10_000_000, duration=car_timer_ms, callback=self._animate_sumo)
+                    add_timer(self.plotter, car_timer_ms, self._animate_sumo)
                     print(f"[sumo] animation timer registered ({car_timer_ms} ms)")
                 if bool(self.args.debug_cars):
                     if not bool(self.car_anim["enabled"]):
                         print("[cars-debug] animation timer not started: no active cars")
                     elif float(self.args.traffic_speed) <= 0.0:
                         print("[cars-debug] animation timer not started: traffic_speed <= 0")
-                self.plotter.add_timer_event(max_steps=1, duration=300, callback=self._mark_interactive_ready)
-                self.plotter.add_timer_event(max_steps=1, duration=800, callback=self._deferred_ssao_enable)
-                self.plotter.add_timer_event(max_steps=1, duration=500, callback=self._deferred_initial_render)
+                add_timer(self.plotter, 300, self._mark_interactive_ready, repeating=False)
+                add_timer(self.plotter, 800, self._deferred_ssao_enable, repeating=False)
+                add_timer(self.plotter, 500, self._deferred_initial_render, repeating=False)
 
             self._show_key_legend()
             self._print_startup_banner()
@@ -2327,7 +2425,8 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                 t0 = time.perf_counter()
                 fired = {"ready": False, "init": False, "ssao": False}
                 last = {"shadow": 0.0, "ga": 0.0, "weather": 0.0, "tod": 0.0,
-                        "parking": 0.0, "heatmap": 0.0, "tl": 0.0, "analysis": 0.0}
+                        "parking": 0.0, "heatmap": 0.0, "tl": 0.0, "analysis": 0.0,
+                        "flood": 0.0}
                 # ── Fixed-rate physics (20 Hz) + per-frame interpolated render ──
                 _PHYS_DT      = 0.050        # physics step: 50 ms = 20 Hz
                 _TL_DTMS      = 100.0        # traffic-light color refresh: 10 Hz
@@ -2429,6 +2528,13 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                             if (_pprev is not None and _pcurr is not None
                                     and _pprev.shape == _pcurr.shape):
                                 _ipos = _pprev + _alpha * (_pcurr - _pprev)
+                                # Relocated cars (deadlock teleport, parking-exit
+                                # recycle, reroute scatter) would otherwise streak
+                                # across the map for one physics step: snap any car
+                                # that moved further than physically possible.
+                                _jump = np.linalg.norm(_pcurr[:, :2] - _pprev[:, :2], axis=1) > 15.0
+                                if _jump.any():
+                                    _ipos[_jump] = _pcurr[_jump]
                             else:
                                 _ipos = _pcurr
                             self._render_cars(_ipos)
@@ -2489,6 +2595,8 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
                             last["parking"] = ms; self._animate_parking(0)
                         if ms - last["heatmap"] >= _OV_DTMS:
                             last["heatmap"] = ms; self._animate_aq_overlay(0)
+                        if ms - last["flood"] >= _OV_DTMS and hasattr(self, "_animate_flood_puddles"):
+                            last["flood"] = ms; self._animate_flood_puddles(0)
 
                         if _prof: _prof.record("overlay", (time.perf_counter() - _pt) * 1e3)
 
@@ -2922,4 +3030,6 @@ class DigitalTwinApp(CarMixin, PedMixin, CyclistMixin, BusMixin, EmergencyMixin,
 
 if __name__ == '__main__':
     app = DigitalTwinApp()
+    if not app._init_ok:
+        raise SystemExit(1)
     app.run()

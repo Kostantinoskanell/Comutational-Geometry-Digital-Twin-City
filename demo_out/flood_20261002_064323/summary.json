@@ -1,0 +1,62 @@
+{
+  "storm": "v1_nov2025",
+  "storm_total_mm": 25.4,
+  "grid_m": 2.0,
+  "runs": {
+    "baseline": {
+      "flooded_area_ha": 3.744,
+      "flooded_area_deep_ha": 0.918,
+      "max_depth_m": 3.9138095378875732,
+      "mean_depth_flooded_m": 0.27690520882606506,
+      "volume_rain_m3": 13032.155799996397,
+      "volume_infiltrated_m3": 613.2361011770045,
+      "volume_drained_m3": 0.0,
+      "volume_outflow_m3": 3654.117845719537,
+      "volume_stored_end_m3": 8764.801853101635,
+      "infiltrated_pct": 4.705561463416314,
+      "peak_hazard": 21.038963317871094,
+      "hazardous_area_ha": 0.2744,
+      "closure_rel": -1.3650632051746493e-13,
+      "wall_s": 77.81,
+      "buildings_total": 664.0,
+      "buildings_flooded_10cm": 111.0,
+      "buildings_flooded_30cm": 18.0
+    },
+    "design": {
+      "flooded_area_ha": 3.3556,
+      "flooded_area_deep_ha": 0.8276,
+      "max_depth_m": 3.9138095378875732,
+      "mean_depth_flooded_m": 0.27082154154777527,
+      "volume_rain_m3": 13032.155799996397,
+      "volume_infiltrated_m3": 1829.875936346514,
+      "volume_drained_m3": 35.06920943441248,
+      "volume_outflow_m3": 3089.7720405884224,
+      "volume_stored_end_m3": 8077.438613628869,
+      "infiltrated_pct": 14.041237416353017,
+      "peak_hazard": 21.038963317871094,
+      "hazardous_area_ha": 0.2392,
+      "closure_rel": -1.397165918588777e-13,
+      "wall_s": 46.02,
+      "buildings_total": 664.0,
+      "buildings_flooded_10cm": 97.0,
+      "buildings_flooded_30cm": 14.0
+    }
+  },
+  "design": {
+    "bioretention pond / rain garden": 1,
+    "bioswale": 1,
+    "porous bikelane": 1,
+    "permeable paving": 1,
+    "trees": 14,
+    "drains": 4,
+    "official Masar corridor": 1
+  },
+  "georeference": {
+    "crs": "EPSG:32636",
+    "minx": 732993.1750927734,
+    "maxy": 3753898.476220703,
+    "res": 2.0,
+    "width": 285,
+    "height": 587
+  }
+}

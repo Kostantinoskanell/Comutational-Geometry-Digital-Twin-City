@@ -62,28 +62,44 @@ def load_osm_direction_graph_cached(
     cache_dir: Path | None,
     use_cache: bool,
     cache_context_key: str,
-) -> nx.MultiDiGraph:
-    """Fetch and cache an OSM drive graph used only for road-direction lookup."""
+) -> nx.MultiDiGraph | None:
+    """Fetch and cache an OSM drive graph used only for road-direction lookup
+    (None if Overpass is unreachable on every endpoint)."""
     bbox_wsen = tuple(float(v) for v in bbox_wsen)
     crs_key = str(target_crs) if target_crs is not None else "default"
     cache_key = _cache_key("osm-direction", cache_context_key, bbox_wsen, crs_key)
     cache_path = None if cache_dir is None else cache_dir / f"osm_dir_{cache_key}.pkl"
 
     if use_cache and cache_path is not None and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            graph = pickle.load(f)
-        print(f"[turn-restr] Loaded OSM direction cache: {cache_path.name}")
-        return graph
+        try:
+            with open(cache_path, "rb") as f:
+                graph = pickle.load(f)
+            print(f"[turn-restr] Loaded OSM direction cache: {cache_path.name}")
+            return graph
+        except Exception as exc:          # partial/corrupt cache = miss, never a crash
+            print(f"[turn-restr] direction cache unreadable ({type(exc).__name__}) — refetching")
+            cache_path.unlink(missing_ok=True)
 
-    raw = ox.graph_from_bbox(bbox_wsen, network_type="drive", retain_all=True)
+    from osm_net import with_overpass_fallback
+    try:
+        raw = with_overpass_fallback(
+            lambda: ox.graph_from_bbox(bbox_wsen, network_type="drive", retain_all=True), label="turn-restr")
+    except Exception as exc:
+        # Direction lookup is an enhancement (one-way legality); every caller
+        # handles None. Never abort scene startup because Overpass is down.
+        print(f"[turn-restr] OSM direction graph unavailable ({type(exc).__name__}); "
+              "one-way directions from Overture only — rerun later to refine (result not cached)")
+        return None
     graph = ox.projection.project_graph(raw, to_crs=target_crs) if target_crs is not None else ox.projection.project_graph(raw)
     graph.graph["source_bbox_wsen"] = bbox_wsen
     graph.graph["direction_only"] = True
 
     if use_cache and cache_path is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "wb") as f:
+        tmp = cache_path.with_name(cache_path.name + ".tmp")
+        with open(tmp, "wb") as f:
             pickle.dump(graph, f)
+        tmp.replace(cache_path)            # atomic: no truncated cache on failure
         print(f"[turn-restr] Saved OSM direction cache: {cache_path.name}")
 
     return graph

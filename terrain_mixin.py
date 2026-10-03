@@ -348,6 +348,13 @@ class TerrainMixin:
         # ── Lift TL mesh and rebuild glyph actor ──────────────────────────
         self._drape_tl_glyphs(dem)
 
+        # ── Lift the instanced parked-car fleet (render.instanced_cars) ────
+        _pfleet = self.scene_state.get("_parked_fleet")
+        if _pfleet is not None and _pfleet.n:
+            _pz0 = _pfleet.positions[:, 2].copy()
+            self.scene_state["_orig_parked_fleet_z"] = _pz0
+            _pfleet.set_z(_pz0 + np.asarray(dem(_pfleet.positions[:, :2]), dtype=float))
+
         # ── Lift parked car actors (one DEM call for all) ─────────────────
         _parked = self.scene_state.get("_parked_car_actors") or []
         if _parked:
@@ -397,6 +404,50 @@ class TerrainMixin:
         for _ub_i in range(int(self.scene_state.get("_user_building_count", 0))):
             self._drape_actor_points(f"user_building_{_ub_i + 1}", dem)
 
+        # ── Lift user-placed green-corridor objects (editor 'j'/'k' modes) ─
+        for _kind in ("greenspace", "strip", "drain"):
+            for _i in range(int(self.scene_state.get(f"_user_{_kind}_count", 0))):
+                _key = f"user_{_kind}_{_i + 1}"
+                if self.scene_state.get(_key) is not None:
+                    self._drape_over_ground(_key, dem)
+        for _st_i in range(int(self.scene_state.get("_user_stairs_count", 0))):
+            self._drape_actor_points(f"user_stairs_{_st_i + 1}", dem)
+
+        # ── Lift flood/corridor overlays (flood_mixin, if built) ──────────
+
+
+
+
+        # ── Lift the photoreal survey ground (render.survey_mixin) ────────
+        # +0.3 matches the ground-mesh road bias, and the photo is further
+        # kept above the coarse draped stylized layers (see SurveyMixin).
+        self._drape_survey_ground(dem)
+        # Flood/corridor overlays ride on the draped ground (photo or roads).
+        self._drape_over_ground("flood_puddles_actor", dem)
+        self._drape_over_ground("corridor_materials_actor", dem)
+        # Flood Lab layers (live depth / change / hazard grid, water, official decal)
+        if hasattr(self, "_lab_drape"):
+            self._lab_drape(True)
+            self._drape_over_ground("lab_official_actor", dem)
+        # Physical flood water rides on the draped photo ground (after it).
+        _fw = getattr(self, "_flood_water", None)
+        if _fw is not None:
+            _base = np.asarray(dem(_fw.xy), dtype=float) + 0.3
+            _photo = self.scene_state.get("survey_ground_actor")
+            if _photo is not None:
+                from render.survey_mixin import _surface_height_at, _PHOTO_Z
+                _top = _surface_height_at(_photo.GetMapper().GetInputDataObject(0, 0), _fw.xy)
+                if _top is not None:
+                    _ok = np.isfinite(_top)
+                    _base[_ok] = np.maximum(_base[_ok], _top[_ok] - _PHOTO_Z)
+            _fw.set_base(_base)
+        # Rooftops follow the per-vertex building drape exactly (same xy, same dem).
+        self._drape_actor_points("survey_roofs_actor", dem)
+        self._drape_actor_points("building_outline_actor", dem)     # per-vertex, same as buildings
+        # nDSM structures: heights are above the local DTM, so per-vertex drape.
+        self._drape_actor_points("survey_struct_walls_actor", dem)
+        self._drape_actor_points("survey_struct_roofs_actor", dem)
+
         # ── Lift parking-lot glyph cars (parking_mixin pool) ──────────────
         self._drape_actor_points("_parked_cars_actor", dem)
 
@@ -438,6 +489,12 @@ class TerrainMixin:
         # Restore TL glyphs
         self._restore_tl_glyphs()
 
+        # Restore the instanced parked-car fleet
+        _pfleet = self.scene_state.get("_parked_fleet")
+        _pz0 = self.scene_state.pop("_orig_parked_fleet_z", None)
+        if _pfleet is not None and _pz0 is not None:
+            _pfleet.set_z(_pz0)
+
         # Restore parked cars
         _parked  = self.scene_state.get("_parked_car_actors") or []
         _orig_pz = self.scene_state.get("_orig_parked_z") or []
@@ -474,6 +531,28 @@ class TerrainMixin:
         # Restore user-placed buildings
         for _ub_i in range(int(self.scene_state.get("_user_building_count", 0))):
             self._restore_actor_points(f"user_building_{_ub_i + 1}")
+
+        # Restore user-placed green-corridor objects
+        for _kind in ("greenspace", "strip", "drain"):
+            for _i in range(int(self.scene_state.get(f"_user_{_kind}_count", 0))):
+                self._restore_actor_points(f"user_{_kind}_{_i + 1}")
+        for _st_i in range(int(self.scene_state.get("_user_stairs_count", 0))):
+            self._restore_actor_points(f"user_stairs_{_st_i + 1}")
+
+        # Restore flood/corridor overlays
+        self._restore_actor_points("flood_puddles_actor")
+        _fw = getattr(self, "_flood_water", None)
+        if _fw is not None:
+            _fw.set_base(None)
+        self._restore_actor_points("corridor_materials_actor")
+        self._restore_actor_points("survey_ground_actor")
+        self._restore_actor_points("survey_roofs_actor")
+        self._restore_actor_points("building_outline_actor")
+        if hasattr(self, "_lab_drape"):
+            self._lab_drape(False)
+            self._restore_actor_points("lab_official_actor")
+        self._restore_actor_points("survey_struct_walls_actor")
+        self._restore_actor_points("survey_struct_roofs_actor")
 
         # Restore parking-lot glyph cars
         self._restore_actor_points("_parked_cars_actor")

@@ -102,6 +102,57 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use only solarcar.obj for all traffic; enable solar routing UI.",
     )
+    parser.add_argument(
+        "--flood-analysis",
+        action="store_true",
+        help=(
+            "Import a precomputed Beirut pluvial-flood scenario from "
+            "Beirut_Project-main/output/ and render puddle + green-corridor "
+            "overlays. Beirut-specific: only meaningful when --address geocodes "
+            "near the corridor domain the flood solver covers."
+        ),
+    )
+    parser.add_argument(
+        "--flood-storm",
+        choices=["t2", "t10", "t10cc", "t50", "flat30", "v1_nov2025"],
+        default="v1_nov2025",
+        help="Design storm to import for --flood-analysis (see Beirut_Project-main/storms/).",
+    )
+    parser.add_argument(
+        "--flood-phase",
+        choices=["before", "after"],
+        default="after",
+        help="Flood scenario phase: 'before' or 'after' the green corridor (--flood-analysis).",
+    )
+    parser.add_argument("--no-survey", action="store_true",
+                        help="Ignore the preprocessed drone survey (cache/survey) and use the Copernicus DEM only.")
+    parser.add_argument("--no-building-reconcile", action="store_true",
+                        help="Keep source (Overture/OSM) buildings as-is instead of validating/re-heighting them against the survey nDSM.")
+    parser.add_argument("--no-photoreal", action="store_true",
+                        help="Start in the stylized analysis ground view instead of the photoreal survey ground.")
+    parser.add_argument("--no-flood-lab", action="store_true",
+                        help="Disable the in-app Flood Lab (live flood solver, design tools, comparison).")
+    parser.add_argument("--flood-lab-res", choices=("preview", "fine"), default="preview",
+                        help="Flood Lab solver grid: preview = 2 m (seconds per storm), fine = 1 m (minutes).")
+    parser.add_argument("--preset", choices=("beirut-corridor",), default="",
+                        help="beirut-corridor: centre the scene on the Al-Masar flood-study domain, terrain on, "
+                             "Flood Lab ready.")
+    parser.add_argument("--terrain-on", action="store_true", help="Start with the terrain drape enabled.")
+    parser.add_argument("--render-quality", choices=("performance", "quality", "legacy"), default="quality",
+                        help="Post-processing: 'performance' = FXAA; 'quality' adds SSAO; "
+                             "'legacy' = the old renderer path (default: quality).")
+    parser.add_argument("--no-facades", action="store_true",
+                        help="Plain building walls instead of procedural PBR facades (windows, lit at night).")
+    parser.add_argument("--no-physical-sky", action="store_true",
+                        help="Use the flat gradient background instead of the physically based sky.")
+    parser.add_argument("--no-survey-structures", action="store_true",
+                        help="Do not add the visual-only city fabric extracted from the survey nDSM.")
+    parser.add_argument("--survey-elev-res", type=float, default=0.5,
+                        help="Survey terrain sampler grid spacing in metres (default 0.5).")
+    parser.add_argument("--survey-tex-px", type=int, default=8192,
+                        help="Max orthophoto texture size in pixels on the longest side (default 8192).")
+    parser.add_argument("--survey-mesh-res", type=float, default=2.0,
+                        help="Photoreal ground mesh vertex spacing in metres (default 2.0).")
     parser.add_argument("--light-radius", type=float, default=40.0, help="Streetlight illumination radius.")
     parser.add_argument(
         "--light-strategy",
@@ -235,7 +286,8 @@ def parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="Output path for the JSON profile report (default: profile_report.json).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    return _apply_preset(args)
 
 
 def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
@@ -316,6 +368,9 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
     roads_var        = tk.BooleanVar(value=not bool(args.hide_roads))
     show_cars_var    = tk.BooleanVar(value=bool(getattr(args, "show_cars", True)))
     solar_fleet_var  = tk.BooleanVar(value=bool(getattr(args, "solar_fleet", False)))
+    flood_var        = tk.BooleanVar(value=bool(getattr(args, "flood_analysis", False)))
+    flood_storm_var  = tk.StringVar(value=str(getattr(args, "flood_storm", "v1_nov2025")))
+    flood_phase_var  = tk.StringVar(value=str(getattr(args, "flood_phase", "after")))
 
     lights_var       = tk.StringVar(value=str(int(args.n_lights)))
     light_radius_var = tk.StringVar(value=str(int(float(args.light_radius))))
@@ -374,6 +429,22 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
         row=4, column=0, columnspan=3, sticky="w", padx=10, pady=3)
     ttk.Checkbutton(tab1, text="Optimize on Open  (run GA before viewer)",  variable=optimize_var).grid(
         row=5, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+    terrain_on_var = tk.BooleanVar(value=bool(getattr(args, "terrain_on", False)))
+    ttk.Checkbutton(tab1, text="Start with terrain (hills + slopes)", variable=terrain_on_var).grid(
+        row=6, column=0, columnspan=3, sticky="w", padx=10, pady=3)
+
+    def _preset_beirut() -> None:
+        address_var.set("beirut corridor")
+        radius_var.set("700")
+        mode_var.set("view")
+        data_source_var.set("overture")
+        fast_var.set(True)
+        terrain_on_var.set(True)
+
+    ttk.Button(tab1, text="\U0001f327  Beirut flood demo  —  Al-Masar corridor preset", style="Run.TButton",
+               command=_preset_beirut).grid(row=7, column=0, columnspan=3, sticky="ew", padx=8, pady=(12, 4))
+    ttk.Label(tab1, text="Fills in the flood-study area: run the flood live, design the corridor, compare.",
+              style="Sub.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", padx=10)
 
     # ── TAB 2: Traffic ────────────────────────────────────────────────────────
     tab2 = ttk.Frame(notebook, padding=10)
@@ -443,6 +514,57 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
     _entry_row(tab3, "Coverage Jobs",      cov_jobs_var,     "1 – 16",     row=3)
     _entry_row(tab3, "GA Jobs",            ga_jobs_var,      "1 – 16",     row=4)
 
+    # ── TAB 4: Flood (Beirut) ────────────────────────────────────────────────
+    tab4 = ttk.Frame(notebook, padding=10)
+    tab4.columnconfigure(1, weight=1)
+    notebook.add(tab4, text="\U0001f30a Flood (Beirut)")
+
+    ttk.Checkbutton(
+        tab4,
+        text="Run Beirut flood analysis",
+        variable=flood_var,
+        command=lambda: _on_flood_toggle(),
+    ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(3, 8))
+
+    flood_storm_label = ttk.Label(tab4, text="Storm")
+    flood_storm_label.grid(row=1, column=0, sticky="w", padx=(8, 4), pady=5)
+    flood_storm_combo = ttk.Combobox(
+        tab4,
+        textvariable=flood_storm_var,
+        values=["t2", "t10", "t10cc", "t50", "flat30", "v1_nov2025"],
+        state="readonly",
+    )
+    flood_storm_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=5)
+
+    flood_phase_frame = ttk.LabelFrame(tab4, text="Corridor phase", padding=8)
+    flood_phase_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=6)
+    flood_phase_before = ttk.Radiobutton(
+        flood_phase_frame, text="Before (existing surface)", variable=flood_phase_var, value="before",
+    )
+    flood_phase_before.pack(side="left", padx=14)
+    flood_phase_after = ttk.Radiobutton(
+        flood_phase_frame, text="After (green corridor)", variable=flood_phase_var, value="after",
+    )
+    flood_phase_after.pack(side="left", padx=14)
+
+    ttk.Label(
+        tab4,
+        text="Imports a precomputed flood-depth scenario + the green-corridor design "
+             "from Beirut_Project-main/output/ and renders puddle + corridor overlays. "
+             "Beirut-specific — only meaningful when Address geocodes near the corridor.",
+        style="Sub.TLabel",
+        wraplength=480,
+    ).grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 0))
+
+    def _on_flood_toggle(*_: object) -> None:
+        _state = "readonly" if bool(flood_var.get()) else "disabled"
+        flood_storm_combo.configure(state=_state)
+        _radio_state = "normal" if bool(flood_var.get()) else "disabled"
+        flood_phase_before.configure(state=_radio_state)
+        flood_phase_after.configure(state=_radio_state)
+
+    _on_flood_toggle()
+
     # ── Bottom bar ────────────────────────────────────────────────────────────
     bar = ttk.Frame(outer, style="BG.TFrame", padding=(8, 4))
     bar.pack(fill="x", side="bottom")
@@ -491,6 +613,10 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
         args.hide_roads       = not bool(roads_var.get())
         args.show_cars        = bool(show_cars_var.get())
         args.solar_fleet      = bool(solar_fleet_var.get())
+        args.flood_analysis   = bool(flood_var.get())
+        args.terrain_on       = bool(terrain_on_var.get())
+        args.flood_storm      = flood_storm_var.get().strip() or args.flood_storm
+        args.flood_phase      = flood_phase_var.get().strip() or args.flood_phase
         args.n_lights         = int(lights_var.get())
         args.light_radius     = float(light_radius_var.get())
         args.light_strategy   = light_strategy_var.get().strip() or args.light_strategy
@@ -499,4 +625,12 @@ def apply_gui_inputs(args: argparse.Namespace) -> argparse.Namespace:
     except Exception as exc:
         print(f"Invalid GUI input ({exc}). Using previous arguments.")
 
+    return args
+
+
+def _apply_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if getattr(args, "preset", "") == "beirut-corridor":
+        args.address = "beirut corridor"
+        args.radius = max(float(args.radius), 700.0) if float(args.radius) != 250.0 else 700.0
+        args.terrain_on = True
     return args

@@ -476,24 +476,20 @@ def run_safety_study(
             tick_all(lights, dt, traffic_speed)
 
         # Cars yield near active crossings (mirror of car_mixin behaviour)
-        saved = None
+        cap = None
         cps = ped_anim.get("active_crossings") or []
         cxy = _car_xy()
         if cps:
-            cp = np.asarray(cps, dtype=float)
+            cp = np.asarray(cps, dtype=float)[:, :2]
             dmin = np.min(np.linalg.norm(
-                cxy[:, None, :] - cp[None, :, :], axis=2), axis=1)
+                cxy[:, None, :2] - cp[None, :, :], axis=2), axis=1)
             near = dmin < 12.0
             if np.any(near):
-                saved = (np.where(near)[0],
-                         car_anim["desired_speed"][near].copy())
-                car_anim["desired_speed"][near] = np.minimum(
-                    car_anim["desired_speed"][near], 1.4)
+                cap = np.where(near, 1.4, np.inf)
 
         idm_tick(car_anim, car_paths, next_edges, lights, dt=dt,
-                 params=params, rng=rng, traffic_speed=traffic_speed)
-        if saved is not None:
-            car_anim["desired_speed"][saved[0]] = saved[1]
+                 params=params, rng=rng, traffic_speed=traffic_speed,
+                 speed_cap=cap)
 
         advance_peds_core(ped_anim, ped_paths, ped_outgoing, ped_reverse, rng, dt)
 

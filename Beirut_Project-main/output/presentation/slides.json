@@ -1,0 +1,231 @@
+[
+  {
+    "title": "Where the rain goes",
+    "say": "A physics-based flood model of the Fouad Boutros right-of-way, from a 39 GB LiDAR survey at half a metre. Three parts: how it works, how far it can be trusted, what it says about the corridor.",
+    "numbers": [
+      "39 GB airborne LiDAR",
+      "0.5 m grid, 2.3 M cells"
+    ],
+    "asked": []
+  },
+  {
+    "title": "Chapter: how the simulator works",
+    "say": "Section break.",
+    "numbers": [],
+    "asked": []
+  },
+  {
+    "title": "Rain falls on every cell",
+    "say": "Rain-on-grid: rainfall lands on every cell and the water finds its own way downhill. Nothing is pre-routed, so where flooding appears is a result, not an input.",
+    "numbers": [
+      "9 land-cover classes set infiltration, roughness, detention",
+      "25 Nov 2025: 25.4 mm in 30 min - only a 2-5 year burst",
+      "Mass balance closes to 3e-5 every run"
+    ],
+    "asked": [
+      [
+        "Why does an ordinary storm flood the city?",
+        "Not extreme rainfall. Ordinary rain on steep, sealed streets with limited inlet capacity."
+      ],
+      [
+        "Rain on roofs?",
+        "Rerouted to the nearest street cell. Courtyards too."
+      ]
+    ]
+  },
+  {
+    "title": "What makes it different",
+    "say": "Two things. The physics other packages leave out - infiltration, detention, gullies that respond to head - and a solver you can differentiate, so it can design as well as predict.",
+    "numbers": [
+      "None of the 19 packages in the EA benchmark model infiltration or green infrastructure at all - they are hydraulics only",
+      "None is differentiable; ours gives d(flooded area)/d(design) to 2e-8",
+      "Two schemes in one code, so scheme error is measured, not assumed",
+      "Written in PyTorch on GPU - what makes the adjoint and ensembles affordable"
+    ],
+    "asked": [
+      [
+        "Why does differentiability matter?",
+        "It turns the model from a predictor into a designer. Instead of testing a handful of layouts by hand you get the gradient of flooding with respect to every cell of the design, and can optimise directly. Nothing else in the field does this."
+      ],
+      [
+        "Isn't this just another SWE solver?",
+        "The hydraulics are standard and deliberately so - that is what lets us benchmark against everyone else. What is new is the surface model on top and the fact that the whole thing is differentiable."
+      ],
+      [
+        "What is it worse at?",
+        "No 1D sewer or river coupling, so two of the eight EA tests are out of scope. And the shock-capturing scheme costs about 3.5x the fast one."
+      ]
+    ]
+  },
+  {
+    "title": "The corridor, surface by surface",
+    "say": "The design is written into the terrain cell by cell - seven surface types, each with its own infiltration, roughness and detention depth.",
+    "numbers": [
+      "31,828 m2 total",
+      "Rain garden is 52% of it",
+      "Bioswales + ponds together under 4,000 m2"
+    ],
+    "asked": [
+      [
+        "How faithful is the layout?",
+        "SAY THIS UNPROMPTED. Zone polygon and alignment are real data. The cross-section - band widths, where swales sit, pond and terrace placement - is our reading of the published drawings plus what seemed hydraulically sensible. Faithful in spirit, not a construction spec. If the design team shares real dimensions it is a data swap and a re-run, not a rebuild."
+      ],
+      [
+        "Which element does the work?",
+        "Mostly plain permeable ground, not the engineered features."
+      ]
+    ]
+  },
+  {
+    "title": "Chapter: validation",
+    "say": "Section break.",
+    "numbers": [],
+    "asked": []
+  },
+  {
+    "title": "Against an independent solver",
+    "say": "The strongest evidence here. A separate code, written by a different group, solving the full equations with a different scheme, on the identical grid and storm.",
+    "numbers": [
+      "HLLC vs SynxFlow: IoU 0.913, corr 0.985, RMSE 3.7 cm",
+      "Inertial vs SynxFlow: IoU 0.690, RMSE 7.8 cm, +27% wet area",
+      "LISFLOOD-FP: fabricated 6x the input volume, failed its own mass balance"
+    ],
+    "asked": [
+      [
+        "Why is the fast scheme biased?",
+        "It drops the advective momentum term, so it smears the flood front. Matters here because these streets run supercritical at 6-8 m/s on a 6% grade."
+      ],
+      [
+        "Is LISFLOOD's failure our fault?",
+        "No - documented limitation of its scheme on terrain with retaining walls. Its raster is void rather than merely different."
+      ]
+    ]
+  },
+  {
+    "title": "Benchmark: Test 8A",
+    "say": "The EA case closest to what we do: direct rainfall on a real dense street network. We are inside the main cluster at all four gauges with published curves.",
+    "numbers": [
+      "P1 0.579 \u00b7 P2 0.239 \u00b7 P3 0.726 \u00b7 P6 0.064 m",
+      "19 packages in the published comparison",
+      "Dark bar excludes the report's own approximate codes"
+    ],
+    "asked": [
+      [
+        "Why only four points?",
+        "Only four have published time series in the report."
+      ],
+      [
+        "How accurate are the bands?",
+        "Read off the report's figures, so good to a centimetre or two. We sit well inside them, not on the edges."
+      ]
+    ]
+  },
+  {
+    "title": "Benchmark: Test 4",
+    "say": "Tests how fast a flood front travels and how deep the water is behind it. In cluster at all nine points, on both schemes.",
+    "numbers": [
+      "Built from the written spec - the EA supplies no terrain file for this case",
+      "5 of 5 analytic tests pass: conservation, Manning normal depth, well-balancedness, reference-port equivalence"
+    ],
+    "asked": [
+      [
+        "Why not all eight EA tests?",
+        "The rest need data files we do not have, and two need coupled 1D sewer or river models we do not implement. Test 3 is the one worth acquiring - it discriminates shock-capturing schemes, which is exactly our new capability."
+      ]
+    ]
+  },
+  {
+    "title": "Resolution",
+    "say": "The EA report says it is unclear whether finer than 2 m is worth it, and recommends someone test at 0.5 m. This is that test.",
+    "numbers": [
+      "0.5 m: 9.4% benefit \u00b7 2 m: 0.6%",
+      "Peak velocity climbs 4.3 -> 14.8 m/s as the grid coarsens",
+      "Same terrain coarsened, so only the grid changes"
+    ],
+    "asked": [
+      [
+        "Why does velocity go up?",
+        "Block-averaging manufactures artificial steep gradients while erasing the kerbs and narrow streets that convey the water. Wrong direction and physically implausible - that is the point."
+      ],
+      [
+        "Is this a fair test?",
+        "Caveat honestly: coarsening is not identical to building natively at 2 m, where roughness would be recalibrated. Direction and size are unambiguous."
+      ]
+    ]
+  },
+  {
+    "title": "Chapter: Beirut",
+    "say": "Section break.",
+    "numbers": [],
+    "asked": []
+  },
+  {
+    "title": "Before and after",
+    "say": "The observed storm, before and after, difference on the right. Blue is drier.",
+    "numbers": [
+      "Effect extends beyond the ribbon into surrounding streets",
+      "The corridor follows a natural drainage axis - it is already where the water wants to go"
+    ],
+    "asked": [
+      [
+        "What is the large square top-left?",
+        "A real deep excavation on a construction site, surveyed by the LiDAR and modelled as a basin. Genuine terrain, not an artefact."
+      ]
+    ]
+  },
+  {
+    "title": "Results",
+    "say": "Over half the flooding removed underfoot in a frequent storm, about half in the observed event, essentially nothing in a 50-year storm - which is the next slide.",
+    "numbers": [
+      "Benefit reaches roughly two blocks, then fades",
+      "Metric excludes the fifth of the corridor dug out to hold water",
+      "Those cells are 20% of the ribbon but 34% of its wet area"
+    ],
+    "asked": [
+      [
+        "Why exclude the ponds?",
+        "Counting a full bioretention pond as flooding penalises the design for working. The published study drew the same distinction."
+      ]
+    ]
+  },
+  {
+    "title": "The severe storm, and a correction",
+    "say": "In a 50-year storm the corridor stops keeping itself dry and starts protecting everywhere else. Two different jobs; only the second survives an extreme event.",
+    "numbers": [
+      "T50: area barely moves, but +2,124 m3 absorbed and outflow cut 11%",
+      "Infiltration multiple is 1.3x, NOT the 3x previously claimed",
+      "Absolute gain (~900 m3 observed storm) holds up"
+    ],
+    "asked": [
+      [
+        "Why did the infiltration claim shrink?",
+        "Better soil physics. Ordinary Beirut ground absorbs far more than a constant rate implied, so the corridor's relative contribution is smaller. Better physics, smaller claim - say it plainly."
+      ]
+    ]
+  },
+  {
+    "title": "What would make this a validated model \u2014 the ask",
+    "say": "Verified, not validated. It solves the equations correctly and agrees with an independent solver to 3.7 cm - but every comparison is against another model, never a measured flood in Beirut.",
+    "numbers": [
+      "Needed: water marks at a few dozen streets after the next big storm",
+      "Plus a handful of low-cost depth loggers, and timing",
+      "No specialist equipment, no large team"
+    ],
+    "asked": [
+      [
+        "Can we use the numbers meanwhile?",
+        "Yes, with care. The study reports differences, and a systematic bias affects both scenarios and largely cancels. Absolutes carry more uncertainty."
+      ],
+      [
+        "How can we help?",
+        "OFFER THIS. The model already predicts where flooding concentrates, so we can site the loggers and surveys efficiently. Makes it a collaboration, not a favour."
+      ]
+    ]
+  },
+  {
+    "title": "Close",
+    "say": "Thank you / questions.",
+    "numbers": [],
+    "asked": []
+  }
+]
